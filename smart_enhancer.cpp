@@ -2,7 +2,6 @@
 #include <android/bitmap.h>
 #include <opencv2/opencv.hpp>
 
-// تحويل Android Bitmap إلى cv::Mat (RGBA)
 void bitmapToMat(JNIEnv *env, jobject bitmap, cv::Mat &mat) {
     AndroidBitmapInfo info;
     void *pixels;
@@ -13,7 +12,6 @@ void bitmapToMat(JNIEnv *env, jobject bitmap, cv::Mat &mat) {
     AndroidBitmap_unlockPixels(env, bitmap);
 }
 
-// نقل cv::Mat المكتملة إلى Android Bitmap
 void matToBitmap(JNIEnv *env, const cv::Mat &mat, jobject bitmap) {
     AndroidBitmapInfo info;
     void *pixels;
@@ -33,43 +31,67 @@ Java_com_master_aistudio_utils_NativeSmartEnhancer_nativeEnhance(
     cv::Mat srcRGBA;
     bitmapToMat(env, srcBitmap, srcRGBA);
 
-    // 1. تحويل الصورة إلى RGB ثم إلى Float32 للمعالجة عالية الدقة
-    cv::Mat srcRGB, floatImg;
+    // 1. تحويل الصورة إلى RGB
+    cv::Mat srcRGB;
     cv::cvtColor(srcRGBA, srcRGB, cv::COLOR_RGBA2RGB);
-    srcRGB.convertTo(floatImg, CV_32FC3, 1.0 / 255.0);
 
-    // 2. حساب مستوى التباين والسطوع لضبط القوة تلقائياً (Evaluation)
-    cv::Mat gray;
-    cv::cvtColor(srcRGBA, gray, cv::COLOR_RGBA2GRAY);
-    cv::Scalar mean, stddev;
-    cv::meanStdDev(gray, mean, stddev);
-    float contrast = stddev[0]; // التباين الحالي
+    // 2. التحويل إلى فضاء الألوان LAB (لفصل الإضاءة L عن قنوات الألوان a, b)
+    cv::Mat labImg;
+    cv::cvtColor(srcRGB, labImg, cv::COLOR_RGB2Lab);
 
-    // 3. مرحلة Clarity Boost (إبراز التفاصيل بناءً على التباين)
-    float clarityStrength = (contrast > 60.0f) ? 0.04f : 0.065f;
-    cv::Mat blurredClarity, detail;
-    cv::GaussianBlur(floatImg, blurredClarity, cv::Size(0, 0), 3.0);
-    cv::subtract(floatImg, blurredClarity, detail);
-    cv::scaleAdd(detail, clarityStrength, floatImg, floatImg);
+    std::vector<cv::Mat> labChannels;
+    cv::split(labImg, labChannels); // labChannels[0] = L, [1] = a, [2] = b
 
-    // 4. مرحلة Crystal Sharpen & Micro Detail (رفع الحدة التكيفية)
-    cv::Mat blurredSharpen, sharp;
-    cv::GaussianBlur(floatImg, blurredSharpen, cv::Size(0, 0), 1.0);
-    cv::addWeighted(floatImg, 1.35, blurredSharpen, -0.35, 0, floatImg);
+    // --- أ. تطبيق التباين التكيفي المتقدم (CLAHE) على قناة الإضاءة فقط ---
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.2, cv::Size(8, 8));
+    cv::Mat lClahe;
+    clahe->apply(labChannels[0], lClahe);
 
-    // 5. ضبط التباين والعمق (Tonal Depth & Adaptive Contrast)
-    // تطبيق ضغط التباين المطاطي لحماية المناطق المضيئة والغامقة
-    cv::Mat dstRGB;
-    floatImg = (floatImg - 0.5f) * 1.08f + 0.5f; // زيادة التباين بنسبة 8%
-    cv::threshold(floatImg, floatImg, 1.0, 1.0, cv::THRESH_TRUNC); // منع حرق الألوان الفاتحة
-    cv::max(floatImg, 0.0f, floatImg);                           // منع طمس الظلال
+    // --- ب. رفع حدة التفاصيل الدقيقة (Micro-Crisp & Detail Boost) ---
+    cv::Mat lFloat, lBlur, lDetail;
+    lClahe.convertTo(lFloat, CV_32FC1);
 
-    // 6. التحويل العكسي لـ UINT8 و RGBA
-    floatImg.convertTo(dstRGB, CV_8UC3, 255.0);
+    // تفاصيل دقيقة جداً (نصف قطر صغير)
+    cv::GaussianBlur(lFloat, lBlur, cv::Size(0, 0), 1.2);
+    cv::subtract(lFloat, lBlur, lDetail);
+    cv::Mat lEnhancedFloat = lFloat + (lDetail * 0.75f); // تعزيز التفاصيل 75%
+
+    // بروتوكول Clarity للمناطق المتوسطة (نصف قطر أوسع)
+    cv::Mat lBlurMacro, lMacroDetail;
+    cv::GaussianBlur(lEnhancedFloat, lBlurMacro, cv::Size(0, 0), 4.5);
+    cv::subtract(lEnhancedFloat, lBlurMacro, lMacroDetail);
+    lEnhancedFloat = lEnhancedFloat + (lMacroDetail * 0.25f);
+
+    // ضبط الحدود لمنع حرق الإضاءة أو طمس الظلال
+    cv::threshold(lEnhancedFloat, lEnhancedFloat, 255.0, 255.0, cv::THRESH_TRUNC);
+    cv::max(lEnhancedFloat, 0.0f, lEnhancedFloat);
+    lEnhancedFloat.convertTo(labChannels[0], CV_8UC1);
+
+    // إعادة دمج قنوات LAB وتحويلها إلى RGB
+    cv::Mat enhancedLab, enhancedRGB;
+    cv::merge(labChannels, enhancedLab);
+    cv::cvtColor(enhancedLab, enhancedRGB, cv::COLOR_Lab2RGB);
+
+    // --- ج. تعزيز تشبع وحيوية الألوان (Vibrance Boost في HSV) ---
+    cv::Mat hsvImg;
+    cv::cvtColor(enhancedRGB, hsvImg, cv::COLOR_RGB2HSV);
+
+    std::vector<cv::Mat> hsvChannels;
+    cv::split(hsvImg, hsvChannels);
+
+    // زيادة تشبع الألوان (قناة S) بنسبة 15% تكيفياً
+    cv::Mat sFloat;
+    hsvChannels[1].convertTo(sFloat, CV_32FC1);
+    sFloat = sFloat * 1.15f;
+    cv::threshold(sFloat, sFloat, 255.0, 255.0, cv::THRESH_TRUNC);
+    sFloat.convertTo(hsvChannels[1], CV_8UC1);
+
+    cv::merge(hsvChannels, hsvImg);
+    cv::cvtColor(hsvImg, enhancedRGB, cv::COLOR_HSV2RGB);
+
+    // 3. تحويل النتيجة النهائية إلى RGBA وتصديرها للـ Bitmap
     cv::Mat dstRGBA;
-    cv::cvtColor(dstRGB, dstRGBA, cv::COLOR_RGB2RGBA);
+    cv::cvtColor(enhancedRGB, dstRGBA, cv::COLOR_RGB2RGBA);
 
-    // كتابة النتيجة النهائية في الـ Bitmap المخرجة
     matToBitmap(env, dstRGBA, dstBitmap);
 }
-
