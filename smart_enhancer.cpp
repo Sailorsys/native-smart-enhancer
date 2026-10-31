@@ -1,3 +1,23 @@
+// ============================================================================
+// smart_enhancer.cpp — COMPLETE FILE, ready to paste as-is.
+// Base: your v2 file exactly as sent (the one you build the .so from),
+// unchanged EXCEPT the two v2.1 edits:
+//   (1) whiteBalance() REPLACED by the fixed gray-pixel version (same
+//       signature and call site — the JNI pipeline line is untouched).
+//   (2) User curve pre-stage ADDED: CURVE_LUT + applyCurve(), called at
+//       the very start of nativeEnhance(), BEFORE evaluate().
+// Everything else in this file is unchanged from the file you sent:
+// all v2 stages, the dark-flat mask, their order, the JNI name and
+// signature, the includes.
+// Final pipeline order:
+//   applyCurve -> evaluate -> gentleDenoise -> whiteBalance (fixed)
+//   -> buildDarkFlatMask -> darkFlatClean -> clarityBoost (masked)
+//   -> microDetail -> adaptiveContrast -> colorDepth (masked)
+//   -> tonalDepth -> crystalSharpen (masked) -> fineCrisp (masked)
+//   -> highlightSafety (blends toward the curved input, matching your
+//   tested curve -> native workflow).
+// ============================================================================
+
 #include <jni.h>
 #include <android/bitmap.h>
 #include <opencv2/opencv.hpp>
@@ -86,13 +106,13 @@ cv::Mat gaussianBlurCustom(const cv::Mat &src, float radius) {
 }
 
 cv::Mat convolve3x3FindEdges(const cv::Mat &grayFloat) {
-    cv::Mat kernel = (cv::Mat_<float>(3, 3) << 
+    cv::Mat kernel = (cv::Mat_<float>(3, 3) <<
         -1.0f, -1.0f, -1.0f,
         -1.0f,  8.0f, -1.0f,
         -1.0f, -1.0f, -1.0f);
     cv::Mat dst;
     cv::filter2D(grayFloat, dst, CV_32F, kernel, cv::Point(-1, -1), 0, cv::BORDER_REPLICATE);
-    
+
     // Clamp to 0..255
     for (int i = 0; i < dst.rows * dst.cols; ++i) {
         dst.at<float>(i) = clampf(dst.at<float>(i), 0.0f, 255.0f);
@@ -103,7 +123,7 @@ cv::Mat convolve3x3FindEdges(const cv::Mat &grayFloat) {
 cv::Mat findEdgesFromL(const cv::Mat &rgbFloat) {
     int px = rgbFloat.rows * rgbFloat.cols;
     cv::Mat grayFloat(rgbFloat.rows, rgbFloat.cols, CV_32FC1);
-    
+
     const float* src = rgbFloat.ptr<float>();
     float* dst = grayFloat.ptr<float>();
 
@@ -250,7 +270,7 @@ Eval evaluate(const cv::Mat &rgbFloat) {
 cv::Mat gentleDenoise(const cv::Mat &img, const Eval &ev) {
     if (ev.noise < 38.0f) return img;
     float strength = (ev.noise < 55.0f) ? 0.08f : ((ev.noise < 72.0f) ? 0.14f : 0.20f);
-    
+
     cv::Mat blurred = gaussianBlurCustom(img, 0.75f);
     cv::Mat out(img.size(), CV_32FC3);
 
@@ -271,14 +291,19 @@ inline float smoothstep01(float x, float a, float b) {
     return t * t * (3.0f - 2.0f * t);
 }
 
-// v2: conservative global white balance (gray-world on a small copy).
-// Skips itself when: the image is a graphic (intentional colors),
-// the image is near-black (no reliable cast), or no cast is measurable.
-// Correction is capped and partial on purpose: a full neutralization
-// would destroy intentional warmth (sunsets, tungsten mood).
+// v2.1 FIX — replaces the v2 gray-world version (same signature and call
+// site, so the JNI pipeline line is untouched). The gray-world version
+// cooled naturally warm scenes (measured: R-B gap -63% on two real photos)
+// because a red shirt / warm sand skews the global mean. This version
+// estimates the illuminant from NEAR-GRAY pixels only (max-min < 25,
+// luminance 40..220): a gray surface's color IS mostly the light falling
+// on it. If neutrals show no cast (dev < 8.0) the photo is left untouched.
+// Fallback to global means at 0.40 strength if gray pixels are rarer than
+// 3%; gains clamped tighter [0.85, 1.15].
 cv::Mat whiteBalance(const cv::Mat &img, const Eval &ev) {
     if (ev.isGraphic) return img;
 
+    // Estimate on a small copy (<=640 max edge).
     cv::Mat small = img;
     int maxEdge = std::max(img.cols, img.rows);
     if (maxEdge > 640) {
@@ -291,25 +316,42 @@ cv::Mat whiteBalance(const cv::Mat &img, const Eval &ev) {
 
     int n = small.rows * small.cols;
     const float* p = small.ptr<float>();
-    double sr = 0.0, sg = 0.0, sb = 0.0;
+    double sr = 0.0, sg = 0.0, sb = 0.0;        // global sums (fallback)
+    double sgr = 0.0, sgg = 0.0, sgb = 0.0;     // gray-pixel sums
+    int grayCount = 0;
     for (int i = 0; i < n; ++i) {
-        sr += p[i * 3];
-        sg += p[i * 3 + 1];
-        sb += p[i * 3 + 2];
+        float r = p[i * 3], g = p[i * 3 + 1], b = p[i * 3 + 2];
+        sr += r; sg += g; sb += b;
+        float mx = std::max({r, g, b});
+        float mn = std::min({r, g, b});
+        float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+        if ((mx - mn) < 25.0f && lum >= 40.0f && lum <= 220.0f) {
+            sgr += r; sgg += g; sgb += b;
+            ++grayCount;
+        }
     }
-    float mr = static_cast<float>(sr / n);
-    float mg = static_cast<float>(sg / n);
-    float mb = static_cast<float>(sb / n);
+
+    float mr, mg, mb, k;
+    if (grayCount > 0 && grayCount >= static_cast<int>(n * 0.03f)) {
+        mr = static_cast<float>(sgr / grayCount);
+        mg = static_cast<float>(sgg / grayCount);
+        mb = static_cast<float>(sgb / grayCount);
+        k = 0.70f;
+    } else {
+        mr = static_cast<float>(sr / n);
+        mg = static_cast<float>(sg / n);
+        mb = static_cast<float>(sb / n);
+        k = 0.40f;  // fallback: weaker, because global means are untrusted
+    }
+
     float mean = (mr + mg + mb) / 3.0f;
     if (mean < 5.0f) return img;
-
     float dev = std::max({std::abs(mr - mean), std::abs(mg - mean), std::abs(mb - mean)});
-    if (dev < 8.0f) return img;  // no measurable cast: do not touch
+    if (dev < 8.0f) return img;  // neutrals show no cast: do not touch
 
-    float gr = clampf(mean / std::max(1.0f, mr), 0.80f, 1.25f);
-    float gg = clampf(mean / std::max(1.0f, mg), 0.80f, 1.25f);
-    float gb = clampf(mean / std::max(1.0f, mb), 0.80f, 1.25f);
-    const float k = 0.70f;  // partial correction
+    float gr = clampf(mean / std::max(1.0f, mr), 0.85f, 1.15f);
+    float gg = clampf(mean / std::max(1.0f, mg), 0.85f, 1.15f);
+    float gb = clampf(mean / std::max(1.0f, mb), 0.85f, 1.15f);
 
     cv::Mat out(img.size(), CV_32FC3);
     const float* a = img.ptr<float>();
@@ -425,7 +467,7 @@ cv::Mat clarityBoost(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
 cv::Mat microDetail(const cv::Mat &img, const Eval &ev) {
     cv::Mat blurred = gaussianBlurCustom(img, 1.0f);
     cv::Mat grayEdges = findEdgesFromL(img);
-    
+
     int n = img.rows * img.cols;
     std::vector<float> edgeMask(n);
     const float* geP = grayEdges.ptr<float>();
@@ -456,7 +498,7 @@ cv::Mat microDetail(const cv::Mat &img, const Eval &ev) {
 cv::Mat pilContrast(const cv::Mat &img, float factor) {
     int px = img.rows * img.cols;
     const float* a = img.ptr<float>();
-    
+
     double sum = 0.0;
     for (int i = 0; i < px; ++i) {
         sum += 0.299 * a[i * 3] + 0.587 * a[i * 3 + 1] + 0.114 * a[i * 3 + 2];
@@ -662,6 +704,48 @@ cv::Mat highlightSafety(const cv::Mat &img, const cv::Mat &original) {
     return out;
 }
 
+// --- v2.1 Addition: user curve pre-stage ---
+// The user's own "wave" curve from his Snapseed screenshot (RGB master
+// channel), control points (0,0) (59,44) (129,133) (208,208) (255,255).
+// Gentle S-curve: shadows darkened (max -15), midtones lifted slightly
+// (+4), highlights identity. LUT built with monotone cubic (PCHIP)
+// interpolation and verified non-decreasing, so tones never invert.
+// Master curve: same LUT on R, G and B — no hue shift.
+// Called at the very start of nativeEnhance(), BEFORE evaluate().
+
+static const uint8_t CURVE_LUT[256] = {
+    0, 1, 1, 2, 3, 4, 4, 5, 6, 6, 7, 8, 9, 9, 10, 11,
+    11, 12, 13, 13, 14, 15, 15, 16, 17, 17, 18, 19, 20, 20, 21, 22,
+    22, 23, 24, 25, 25, 26, 27, 27, 28, 29, 30, 30, 31, 32, 33, 34,
+    34, 35, 36, 37, 38, 39, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+    49, 50, 51, 52, 53, 54, 56, 57, 58, 59, 60, 62, 63, 64, 65, 67,
+    68, 69, 71, 72, 73, 75, 76, 77, 79, 80, 82, 83, 84, 86, 87, 89,
+    90, 91, 93, 94, 96, 97, 98, 100, 101, 103, 104, 105, 107, 108, 109, 111,
+    112, 113, 115, 116, 117, 119, 120, 121, 122, 124, 125, 126, 127, 128, 130, 131,
+    132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148,
+    149, 150, 151, 152, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163,
+    164, 165, 166, 167, 168, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178,
+    178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 187, 188, 189, 190, 191, 192,
+    193, 194, 195, 196, 197, 198, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207,
+    208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223,
+    224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239,
+    240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255,
+};
+
+// Apply the master curve to a CV_32FC3 image with values in 0..255.
+cv::Mat applyCurve(const cv::Mat &img) {
+    cv::Mat out(img.size(), CV_32FC3);
+    const float* a = img.ptr<float>();
+    float* o = out.ptr<float>();
+    int px = img.rows * img.cols * 3;
+    for (int i = 0; i < px; ++i) {
+        int idx = static_cast<int>(a[i] + 0.5f);
+        idx = std::max(0, std::min(255, idx));
+        o[i] = static_cast<float>(CURVE_LUT[idx]);
+    }
+    return out;
+}
+
 // --- Bitmap Conversion Utilities ---
 
 void bitmapToFloatRgb(JNIEnv *env, jobject bitmap, cv::Mat &matRgbFloat) {
@@ -716,6 +800,11 @@ Java_com_master_aistudio_utils_NativeSmartEnhancer_nativeEnhance(
 
     cv::Mat work;
     bitmapToFloatRgb(env, srcBitmap, work);
+
+    // 0. v2.1 user curve pre-stage: applied BEFORE evaluate(), so the
+    // pipeline measures the curved input — exactly the tested workflow
+    // (curve-adjusted image saved, then passed through native).
+    work = applyCurve(work);
 
     // 1. Evaluate on 1280 max edge preview if larger
     cv::Mat evalSrc = work;
