@@ -4,6 +4,7 @@
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <tuple>
 
 // --- Helper Functions ---
 
@@ -265,7 +266,140 @@ cv::Mat gentleDenoise(const cv::Mat &img, const Eval &ev) {
     return out;
 }
 
-cv::Mat clarityBoost(const cv::Mat &img, const Eval &ev) {
+inline float smoothstep01(float x, float a, float b) {
+    float t = clampf((x - a) / (b - a), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// v2: conservative global white balance (gray-world on a small copy).
+// Skips itself when: the image is a graphic (intentional colors),
+// the image is near-black (no reliable cast), or no cast is measurable.
+// Correction is capped and partial on purpose: a full neutralization
+// would destroy intentional warmth (sunsets, tungsten mood).
+cv::Mat whiteBalance(const cv::Mat &img, const Eval &ev) {
+    if (ev.isGraphic) return img;
+
+    cv::Mat small = img;
+    int maxEdge = std::max(img.cols, img.rows);
+    if (maxEdge > 640) {
+        float s = 640.0f / maxEdge;
+        cv::resize(img, small,
+                   cv::Size(std::max(1, static_cast<int>(img.cols * s)),
+                            std::max(1, static_cast<int>(img.rows * s))),
+                   0, 0, cv::INTER_AREA);
+    }
+
+    int n = small.rows * small.cols;
+    const float* p = small.ptr<float>();
+    double sr = 0.0, sg = 0.0, sb = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sr += p[i * 3];
+        sg += p[i * 3 + 1];
+        sb += p[i * 3 + 2];
+    }
+    float mr = static_cast<float>(sr / n);
+    float mg = static_cast<float>(sg / n);
+    float mb = static_cast<float>(sb / n);
+    float mean = (mr + mg + mb) / 3.0f;
+    if (mean < 5.0f) return img;
+
+    float dev = std::max({std::abs(mr - mean), std::abs(mg - mean), std::abs(mb - mean)});
+    if (dev < 8.0f) return img;  // no measurable cast: do not touch
+
+    float gr = clampf(mean / std::max(1.0f, mr), 0.80f, 1.25f);
+    float gg = clampf(mean / std::max(1.0f, mg), 0.80f, 1.25f);
+    float gb = clampf(mean / std::max(1.0f, mb), 0.80f, 1.25f);
+    const float k = 0.70f;  // partial correction
+
+    cv::Mat out(img.size(), CV_32FC3);
+    const float* a = img.ptr<float>();
+    float* o = out.ptr<float>();
+    int px = img.rows * img.cols * 3;
+    for (int i = 0; i < px; i += 3) {
+        o[i]     = clampf(a[i]     * (1.0f + (gr - 1.0f) * k), 0.0f, 255.0f);
+        o[i + 1] = clampf(a[i + 1] * (1.0f + (gg - 1.0f) * k), 0.0f, 255.0f);
+        o[i + 2] = clampf(a[i + 2] * (1.0f + (gb - 1.0f) * k), 0.0f, 255.0f);
+    }
+    return out;
+}
+
+// v2: dark-AND-flat mask, single-channel float in [0,1].
+// Dark  = luminance weight, full below 45, gone by 95 (the code's own
+//         dark<45 / shadow<80 vocabulary, made soft).
+// Flat  = local standard deviation of the LIGHTLY SMOOTHED luminance.
+//         The smoothing matters: raw grain would raise the local std and
+//         disqualify the very sky we want to treat. Measuring flatness
+//         after a radius-1.0 blur removes grain but keeps real structure
+//         (hair, edges, textures) visible to the std test.
+// Built at half resolution (the mask is smooth by construction) and
+// upsampled with bilinear interpolation, then feathered.
+cv::Mat buildDarkFlatMask(const cv::Mat &img) {
+    cv::Mat half;
+    cv::resize(img, half,
+               cv::Size(std::max(1, img.cols / 2), std::max(1, img.rows / 2)),
+               0, 0, cv::INTER_AREA);
+
+    int w = half.cols, h = half.rows, n = w * h;
+    cv::Mat lum(h, w, CV_32FC1);
+    const float* p = half.ptr<float>();
+    float* l = lum.ptr<float>();
+    for (int i = 0; i < n; ++i)
+        l[i] = 0.299f * p[i * 3] + 0.587f * p[i * 3 + 1] + 0.114f * p[i * 3 + 2];
+
+    cv::Mat ls = gaussianBlurCustom(lum, 1.0f);
+    cv::Mat mean = gaussianBlurCustom(ls, 2.0f);
+    cv::Mat lsSq, meanSq;
+    cv::multiply(ls, ls, lsSq);
+    meanSq = gaussianBlurCustom(lsSq, 2.0f);
+
+    cv::Mat mask(h, w, CV_32FC1);
+    const float* lPtr = lum.ptr<float>();
+    const float* mPtr = mean.ptr<float>();
+    const float* qPtr = meanSq.ptr<float>();
+    float* o = mask.ptr<float>();
+    for (int i = 0; i < n; ++i) {
+        float var = std::max(0.0f, qPtr[i] - mPtr[i] * mPtr[i]);
+        float stdDev = std::sqrt(var);
+        float darkW = 1.0f - smoothstep01(lPtr[i], 45.0f, 95.0f);
+        float flatW = 1.0f - smoothstep01(stdDev, 4.0f, 12.0f);
+        o[i] = darkW * flatW;  // soft AND: must be dark AND flat
+    }
+
+    cv::Mat feathered = gaussianBlurCustom(mask, 2.5f);
+    cv::Mat full;
+    cv::resize(feathered, full, img.size(), 0, 0, cv::INTER_LINEAR);
+    return full;
+}
+
+// v2: treatment applied inside the mask only (see JNI section).
+// One blur-blend does two jobs: it denoises AND it applies negative
+// clarity (pulling pixels toward their local mean removes micro-contrast,
+// and grain IS micro-contrast). Chroma suppression then removes the
+// colored speckles and restores solid blacks. No extra black pull here:
+// tonalDepth's deepBlack already pulls deep blacks globally.
+cv::Mat darkFlatClean(const cv::Mat &img, const cv::Mat &mask) {
+    cv::Mat blurred = gaussianBlurCustom(img, 2.0f);
+    cv::Mat out(img.size(), CV_32FC3);
+    const float* a = img.ptr<float>();
+    const float* b = blurred.ptr<float>();
+    const float* m = mask.ptr<float>();
+    float* o = out.ptr<float>();
+    int n = img.rows * img.cols;
+    for (int i = 0; i < n; ++i) {
+        float s = m[i] * 0.55f;  // cleaning strength knob
+        float r  = a[i * 3]     * (1.0f - s) + b[i * 3]     * s;
+        float g  = a[i * 3 + 1] * (1.0f - s) + b[i * 3 + 1] * s;
+        float bl = a[i * 3 + 2] * (1.0f - s) + b[i * 3 + 2] * s;
+        float lum = 0.299f * r + 0.587f * g + 0.114f * bl;
+        float d = m[i] * 0.45f;  // chroma suppression knob
+        o[i * 3]     = clampf(lum + (r - lum)  * (1.0f - d), 0.0f, 255.0f);
+        o[i * 3 + 1] = clampf(lum + (g - lum)  * (1.0f - d), 0.0f, 255.0f);
+        o[i * 3 + 2] = clampf(lum + (bl - lum) * (1.0f - d), 0.0f, 255.0f);
+    }
+    return out;
+}
+
+cv::Mat clarityBoost(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
     cv::Mat blurred = gaussianBlurCustom(img, 3.0f);
     float strength = 0.055f; // NATURAL mode
     if (ev.contrast > 62.0f) strength *= 0.72f;
@@ -274,12 +408,16 @@ cv::Mat clarityBoost(const cv::Mat &img, const Eval &ev) {
     cv::Mat out(img.size(), CV_32FC3);
     const float* a = img.ptr<float>();
     const float* b = blurred.ptr<float>();
+    const float* m = mask.ptr<float>();
     float* o = out.ptr<float>();
-    int px = img.rows * img.cols * 3;
-
-    for (int i = 0; i < px; ++i) {
-        float detail = clampf(a[i] - b[i], -30.0f, 30.0f);
-        o[i] = clampf(a[i] + detail * strength, 0.0f, 255.0f);
+    int n = img.rows * img.cols;
+    for (int i = 0; i < n; ++i) {
+        float s = strength * (1.0f - m[i]);
+        for (int c = 0; c < 3; ++c) {
+            int idx = i * 3 + c;
+            float detail = clampf(a[idx] - b[idx], -30.0f, 30.0f);
+            o[idx] = clampf(a[idx] + detail * s, 0.0f, 255.0f);
+        }
     }
     return out;
 }
@@ -344,7 +482,7 @@ cv::Mat adaptiveContrast(const cv::Mat &img, const Eval &ev) {
     return pilContrast(img, factor);
 }
 
-cv::Mat colorDepth(const cv::Mat &img, const Eval &ev) {
+cv::Mat colorDepth(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
     int px = img.rows * img.cols;
     const float* a = img.ptr<float>();
 
@@ -370,19 +508,27 @@ cv::Mat colorDepth(const cv::Mat &img, const Eval &ev) {
 
     cv::Mat out(img.size(), CV_32FC3);
     float* o = out.ptr<float>();
+    const float* m = mask.ptr<float>();
 
     for (int i = 0; i < px; ++i) {
         auto [h, s, v] = hsv[i];
         float protection = clampf((v / 255.0f - 0.68f) / 0.32f, 0.0f, 1.0f);
         float effective = boost * (1.0f - protection * 0.60f);
+        effective *= (1.0f - (s / 255.0f) * 0.65f);  // (a) vibrance
+        bool skinHue = (h <= 28.0f || h >= 240.0f);
+        if (skinHue && s >= 30.0f && s <= 200.0f && v >= 60.0f && v <= 240.0f)
+            effective *= 0.45f;  // (b) skin guard
+        effective *= (1.0f - m[i]);  // (c) mask gate
+
         float newS = clampf(s * (1.0f + effective), 0.0f, 255.0f);
 
         float r, g, b;
         pillowHsvToRgb(h, newS, v, r, g, b);
-        o[i * 3] = clampf(r, 0.0f, 255.0f);
+        o[i * 3]     = clampf(r, 0.0f, 255.0f);
         o[i * 3 + 1] = clampf(g, 0.0f, 255.0f);
         o[i * 3 + 2] = clampf(b, 0.0f, 255.0f);
     }
+
     return out;
 }
 
@@ -434,29 +580,32 @@ cv::Mat tonalDepth(const cv::Mat &img, const Eval &ev) {
     return out;
 }
 
-cv::Mat unsharpMask(const cv::Mat &img, float radius, int percent, int threshold) {
+cv::Mat unsharpMask(const cv::Mat &img, float radius, int percent, int threshold,
+                    const cv::Mat &mask) {
     cv::Mat blurred = gaussianBlurCustom(img, radius);
-    int px = img.rows * img.cols * 3;
-
+    int px = img.rows * img.cols;
     const float* srcPx = img.ptr<float>();
     const float* blurPx = blurred.ptr<float>();
-
+    const float* m = mask.ptr<float>();
     cv::Mat out(img.size(), CV_32FC3);
     float* o = out.ptr<float>();
     float amount = percent / 100.0f;
-
     for (int i = 0; i < px; ++i) {
-        float diff = srcPx[i] - blurPx[i];
-        if (std::abs(diff) >= threshold) {
-            o[i] = clampf(srcPx[i] + diff * amount, 0.0f, 255.0f);
-        } else {
-            o[i] = srcPx[i];
+        float am = amount * (1.0f - m[i]);
+        for (int c = 0; c < 3; ++c) {
+            int idx = i * 3 + c;
+            float diff = srcPx[idx] - blurPx[idx];
+            if (std::abs(diff) >= threshold) {
+                o[idx] = clampf(srcPx[idx] + diff * am, 0.0f, 255.0f);
+            } else {
+                o[idx] = srcPx[idx];
+            }
         }
     }
     return out;
 }
 
-cv::Mat crystalSharpen(const cv::Mat &img, const Eval &ev) {
+cv::Mat crystalSharpen(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
     float s = ev.sharpness;
     float n = ev.noise;
 
@@ -479,13 +628,13 @@ cv::Mat crystalSharpen(const cv::Mat &img, const Eval &ev) {
 
     percent = clampi(percent, 40, maxPercent);
 
-    return unsharpMask(img, radius, percent, threshold);
+    return unsharpMask(img, radius, percent, threshold, mask);
 }
 
-cv::Mat fineCrisp(const cv::Mat &img, const Eval &ev) {
+cv::Mat fineCrisp(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
     int percent = 8; // NATURAL
     if (ev.noise > 55.0f) percent = static_cast<int>(percent * 0.60f);
-    return unsharpMask(img, 0.5f, percent, 8);
+    return unsharpMask(img, 0.5f, percent, 8, mask);
 }
 
 cv::Mat highlightSafety(const cv::Mat &img, const cv::Mat &original) {
@@ -580,16 +729,19 @@ Java_com_master_aistudio_utils_NativeSmartEnhancer_nativeEnhance(
 
     Eval ev = evaluate(evalSrc);
 
-    // 2. Pipeline Execution (Faithful order)
+    // 2. Pipeline Execution (v2 order)
     cv::Mat out = gentleDenoise(work, ev);
-    out = clarityBoost(out, ev);
-    out = microDetail(out, ev);
-    out = adaptiveContrast(out, ev);
-    out = colorDepth(out, ev);
-    out = tonalDepth(out, ev);
-    out = crystalSharpen(out, ev);
-    out = fineCrisp(out, ev);
-    out = highlightSafety(out, work);
+    out = whiteBalance(out, ev);                 // v2 NEW
+    cv::Mat darkMask = buildDarkFlatMask(out);   // v2 NEW
+    out = darkFlatClean(out, darkMask);          // v2 NEW
+    out = clarityBoost(out, ev, darkMask);       // v2 signature
+    out = microDetail(out, ev);                  // unchanged
+    out = adaptiveContrast(out, ev);             // unchanged
+    out = colorDepth(out, ev, darkMask);         // v2 signature
+    out = tonalDepth(out, ev);                   // unchanged
+    out = crystalSharpen(out, ev, darkMask);     // v2 signature
+    out = fineCrisp(out, ev, darkMask);          // v2 signature
+    out = highlightSafety(out, work);            // unchanged
 
     // 3. Render back to Bitmap
     floatRgbToBitmap(env, out, dstBitmap);
