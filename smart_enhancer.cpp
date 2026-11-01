@@ -1,30 +1,107 @@
 // ============================================================================
-// smart_enhancer.cpp — COMPLETE FILE, ready to paste as-is.
-// Base: your v2 file exactly as sent (the one you build the .so from),
-// unchanged EXCEPT the two v2.1 edits:
-//   (1) whiteBalance() REPLACED by the fixed gray-pixel version (same
-//       signature and call site — the JNI pipeline line is untouched).
-//   (2) User curve pre-stage ADDED: CURVE_LUT + applyCurve(), called at
-//       the very start of nativeEnhance(), BEFORE evaluate().
-// Everything else in this file is unchanged from the file you sent:
-// all v2 stages, the dark-flat mask, their order, the JNI name and
-// signature, the includes.
-// Final pipeline order:
-//   applyCurve -> evaluate -> gentleDenoise -> whiteBalance (fixed)
-//   -> buildDarkFlatMask -> darkFlatClean -> clarityBoost (masked)
-//   -> microDetail -> adaptiveContrast -> colorDepth (masked)
-//   -> tonalDepth -> crystalSharpen (masked) -> fineCrisp (masked)
-//   -> highlightSafety (blends toward the curved input, matching your
-//   tested curve -> native workflow).
+// smart_enhancer.cpp — v4.1 (COMPLETE FILE, ready to paste as-is)
+// Classical methods only: OpenCV filters + non-local means (a fixed
+// mathematical algorithm). NO neural networks, NO models, NO new libraries
+// beyond OpenCV's own photo module (fastNlMeansDenoising).
+// Same JNI name/signature as v2/v3/v4: the Kotlin side is untouched.
+//
+// WHAT v4 ADDED OVER v3 (each traced to a failure seen on real test photos):
+//   (1) estimateSigma(): robust noise level measured from the photo itself
+//       (Laplacian response on the FLATTEST blocks). Every denoise strength
+//       follows this number; clean photos are skipped automatically.
+//   (2) nlmDenoise(): non-local-means on LUMA ONLY (+ small share of the
+//       original luma, + texture re-injection where real structure exists)
+//       -> removes grain without "staircase"/wax artefacts. Fine chroma
+//       noise is removed with a small-radius luma-guided filter.
+//       Photos above NLM_MAX_PIXELS use a fast guided-filter luma path.
+//   (3) chromaBlotchClean(): removes LARGE colour blotches with a two-scale
+//       luma-guided filter, flattening only the band between a mid and a big
+//       scale, so freckles, lips and real colours survive.
+//   (4) localShadowLift(): halo-free local shadow lift (guided base layer,
+//       detail untouched, deep blacks never lifted).
+//   (5) buildSharpMask(): sharpening/clarity/micro-detail run only where real
+//       structure exceeds the measured noise, never inside the dark-flat mask.
+//   (6) Curve minimum strength 0.40 -> 0.30 (curve points unchanged).
+//
+// v4.1 COLOUR-FIDELITY FIX (measured on a clean night photo: v4 looked cold,
+// face saturation -19% and street -34% relative to lightness):
+//   (a) chromaBlotchClean + darkFlatClean are now GATED by the measured noise
+//       (clean photo -> skipped, noisy photo -> unchanged).
+//   (b) localShadowLift is MULTIPLICATIVE (keeps R:G:B ratios, i.e. warmth)
+//       instead of adding neutral grey light.
+//   (c) chromaRestore(): two-sided saturation anchor. One global factor in
+//       [0.90, 1.12] that lands mid-tone saturation at ~1.03x the
+//       pre-cleaning image: gives back colour the cleaning removed, takes
+//       back colour the contrast stage added. Never changes hue.
+//
+// UNCHANGED FROM v3: evaluate, whiteBalance (v3 rules), buildDarkFlatMask,
+// colorDepth, tonalDepth (adaptive deepBlack), adaptiveContrast (modulated),
+// clarityBoost/microDetail/unsharpMask/crystalSharpen/fineCrisp (they receive
+// the v4 sharp mask), highlightSafety, CURVE_LUT.
+//
+// Pipeline (v4.1):
+//   curve -> evaluate -> whiteBalance -> estimateSigma -> nlmDenoise
+//   -> chromaBlotchClean(gated) -> buildDarkFlatMask -> darkFlatClean(gated)
+//   -> localShadowLift(multiplicative) -> estimateSigma -> buildSharpMask
+//   -> clarityBoost -> microDetail -> adaptiveContrast -> colorDepth
+//   -> tonalDepth -> crystalSharpen -> fineCrisp -> chromaRestore
+//   -> highlightSafety.
+//
+// PERFORMANCE NOTE: the pipeline holds several full-size CV_32FC3 buffers
+// (12 MP = ~144 MB each). For very large photos downscale the input to
+// ~12 MP max before calling, or expect high memory use. Above
+// NLM_MAX_PIXELS the expensive NLM is replaced by a fast guided filter.
+// NOT compiled here against the Android SDK — build in Android Studio.
 // ============================================================================
 
 #include <jni.h>
 #include <android/bitmap.h>
 #include <opencv2/opencv.hpp>
+#include <opencv2/photo.hpp>
 #include <cmath>
 #include <vector>
 #include <algorithm>
 #include <tuple>
+
+// --- knobs (all tunable in one place) ---
+static const float CURVE_DARK_LUM = 30.0f;
+static const float CURVE_FULL_LUM = 90.0f;
+static const float CURVE_MIN_STRENGTH = 0.30f;
+static const float WB_BRIGHT_LUM = 150.0f;
+static const float WB_BRIGHT_FRAC = 0.01f;
+static const float WB_BRIGHT_DEV = 8.5f;
+static const float WB_GRAY_DEV = 8.0f;
+static const float WB_FALLBACK_DEV = 12.0f;
+static const float NLM_MIN_SIGMA = 1.5f;        // below: photo is clean, no denoise
+static const float NLM_H_K = 0.55f;             // h = (k + 0.30*t) * sigma
+static const float NLM_H_MAX = 16.0f;
+static const float NLM_TEXTURE_KEEP = 0.35f;
+static const float NLM_ORIG_KEEP = 0.22f;
+static const float FINE_CHROMA_EPS = 140.0f;
+static const float FINE_CHROMA_BLEND = 0.85f;
+static const int   NLM_MAX_PIXELS = 4000000;
+static const int   FAST_LUMA_RADIUS = 2;
+static const int   GF_SCALE_EDGE = 320;
+static const int   GF_MID_RADIUS = 5;
+static const int   GF_RADIUS = 56;
+static const float GF_EPS = 420.0f;
+static const float CH_DEV_LO = 38.0f;
+static const float CH_DEV_HI = 95.0f;
+static const float CH_STRENGTH = 0.92f;
+static const float CHROMA_GATE_LO = 1.5f;       // v4.1: sigma where chroma cleaning starts
+static const float CHROMA_GATE_HI = 4.0f;       // v4.1: sigma where it is fully on
+static const float RESTORE_MIN = 0.90f;         // v4.1: chromaRestore bounds
+static const float RESTORE_MAX = 1.13f;
+static const float RESTORE_TARGET = 1.03f;
+static const float LIFT_STRENGTH = 0.30f;
+static const float LIFT_GAMMA = 0.78f;
+static const float STRUCT_LO = 1.3f;
+static const float STRUCT_HI = 3.2f;
+static const float CONTRAST_DARK_REF = 35.0f;
+static const float CONTRAST_DARK_FLOOR = 0.35f;
+static const float CONTRAST_BRIGHT_CAP = 0.80f;
+static const float DEEPBLACK_REF = 35.0f;
+static const float DEEPBLACK_FLOOR = 0.35f;
 
 // --- Helper Functions ---
 
@@ -34,6 +111,11 @@ inline float clampf(float v, float minVal, float maxVal) {
 
 inline int clampi(int v, int minVal, int maxVal) {
     return std::max(minVal, std::min(maxVal, v));
+}
+
+inline float smoothstep01(float x, float a, float b) {
+    float t = clampf((x - a) / (b - a), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
 }
 
 void rgbToPillowHsv(float r, float g, float b, float &h, float &s, float &v) {
@@ -105,6 +187,17 @@ cv::Mat gaussianBlurCustom(const cv::Mat &src, float radius) {
     return dst;
 }
 
+// Luminance (CV_32FC1) of a CV_32FC3 RGB image.
+cv::Mat lumaOf(const cv::Mat &img) {
+    int n = img.rows * img.cols;
+    cv::Mat L(img.rows, img.cols, CV_32FC1);
+    const float* a = img.ptr<float>();
+    float* l = L.ptr<float>();
+    for (int i = 0; i < n; ++i)
+        l[i] = 0.299f * a[i * 3] + 0.587f * a[i * 3 + 1] + 0.114f * a[i * 3 + 2];
+    return L;
+}
+
 cv::Mat convolve3x3FindEdges(const cv::Mat &grayFloat) {
     cv::Mat kernel = (cv::Mat_<float>(3, 3) <<
         -1.0f, -1.0f, -1.0f,
@@ -121,19 +214,22 @@ cv::Mat convolve3x3FindEdges(const cv::Mat &grayFloat) {
 }
 
 cv::Mat findEdgesFromL(const cv::Mat &rgbFloat) {
-    int px = rgbFloat.rows * rgbFloat.cols;
-    cv::Mat grayFloat(rgbFloat.rows, rgbFloat.cols, CV_32FC1);
+    return convolve3x3FindEdges(lumaOf(rgbFloat));
+}
 
-    const float* src = rgbFloat.ptr<float>();
-    float* dst = grayFloat.ptr<float>();
-
-    for (int i = 0; i < px; ++i) {
-        float r = src[i * 3];
-        float g = src[i * 3 + 1];
-        float b = src[i * 3 + 2];
-        dst[i] = 0.299f * r + 0.587f * g + 0.114f * b;
+// Chroma (R-Y, G-Y, B-Y) as CV_32FC3.
+static cv::Mat chromaOf(const cv::Mat &img, const cv::Mat &Y) {
+    int n = img.rows * img.cols;
+    cv::Mat ch(img.rows, img.cols, CV_32FC3);
+    const float* a = img.ptr<float>();
+    const float* y = Y.ptr<float>();
+    float* o = ch.ptr<float>();
+    for (int i = 0; i < n; ++i) {
+        o[i * 3]     = a[i * 3]     - y[i];
+        o[i * 3 + 1] = a[i * 3 + 1] - y[i];
+        o[i * 3 + 2] = a[i * 3 + 2] - y[i];
     }
-    return convolve3x3FindEdges(grayFloat);
+    return ch;
 }
 
 // --- Evaluation Struct & Function ---
@@ -267,39 +363,7 @@ Eval evaluate(const cv::Mat &rgbFloat) {
 
 // --- Pipeline Stages ---
 
-cv::Mat gentleDenoise(const cv::Mat &img, const Eval &ev) {
-    if (ev.noise < 38.0f) return img;
-    float strength = (ev.noise < 55.0f) ? 0.08f : ((ev.noise < 72.0f) ? 0.14f : 0.20f);
-
-    cv::Mat blurred = gaussianBlurCustom(img, 0.75f);
-    cv::Mat out(img.size(), CV_32FC3);
-
-    const float* a = img.ptr<float>();
-    const float* b = blurred.ptr<float>();
-    float* o = out.ptr<float>();
-    int px = img.rows * img.cols * 3;
-
-    float u = 1.0f - strength;
-    for (int i = 0; i < px; ++i) {
-        o[i] = clampf(a[i] * u + b[i] * strength, 0.0f, 255.0f);
-    }
-    return out;
-}
-
-inline float smoothstep01(float x, float a, float b) {
-    float t = clampf((x - a) / (b - a), 0.0f, 1.0f);
-    return t * t * (3.0f - 2.0f * t);
-}
-
-// v2.1 FIX — replaces the v2 gray-world version (same signature and call
-// site, so the JNI pipeline line is untouched). The gray-world version
-// cooled naturally warm scenes (measured: R-B gap -63% on two real photos)
-// because a red shirt / warm sand skews the global mean. This version
-// estimates the illuminant from NEAR-GRAY pixels only (max-min < 25,
-// luminance 40..220): a gray surface's color IS mostly the light falling
-// on it. If neutrals show no cast (dev < 8.0) the photo is left untouched.
-// Fallback to global means at 0.40 strength if gray pixels are rarer than
-// 3%; gains clamped tighter [0.85, 1.15].
+// v3 WB (unchanged): relative gray test, bright-neutral decision.
 cv::Mat whiteBalance(const cv::Mat &img, const Eval &ev) {
     if (ev.isGraphic) return img;
 
@@ -318,36 +382,60 @@ cv::Mat whiteBalance(const cv::Mat &img, const Eval &ev) {
     const float* p = small.ptr<float>();
     double sr = 0.0, sg = 0.0, sb = 0.0;        // global sums (fallback)
     double sgr = 0.0, sgg = 0.0, sgb = 0.0;     // gray-pixel sums
+    double sbr = 0.0, sbg = 0.0, sbb = 0.0;     // BRIGHT gray-pixel sums
     int grayCount = 0;
+    int brightCount = 0;
     for (int i = 0; i < n; ++i) {
         float r = p[i * 3], g = p[i * 3 + 1], b = p[i * 3 + 2];
         sr += r; sg += g; sb += b;
         float mx = std::max({r, g, b});
         float mn = std::min({r, g, b});
         float lum = 0.299f * r + 0.587f * g + 0.114f * b;
-        if ((mx - mn) < 25.0f && lum >= 40.0f && lum <= 220.0f) {
+        float grayThr = std::max(25.0f, 0.20f * lum);
+        if ((mx - mn) < grayThr && lum >= 40.0f && lum <= 220.0f) {
             sgr += r; sgg += g; sgb += b;
             ++grayCount;
+            if (lum >= WB_BRIGHT_LUM) {
+                sbr += r; sbg += g; sbb += b;
+                ++brightCount;
+            }
         }
     }
 
     float mr, mg, mb, k;
     if (grayCount > 0 && grayCount >= static_cast<int>(n * 0.03f)) {
-        mr = static_cast<float>(sgr / grayCount);
-        mg = static_cast<float>(sgg / grayCount);
-        mb = static_cast<float>(sgb / grayCount);
-        k = 0.70f;
+        if (brightCount >= static_cast<int>(n * WB_BRIGHT_FRAC)) {
+            mr = static_cast<float>(sbr / brightCount);
+            mg = static_cast<float>(sbg / brightCount);
+            mb = static_cast<float>(sbb / brightCount);
+            k = 0.70f;
+            float bmean = (mr + mg + mb) / 3.0f;
+            if (bmean < 5.0f) return img;
+            float bdev = std::max({std::abs(mr - bmean), std::abs(mg - bmean), std::abs(mb - bmean)});
+            if (bdev < WB_BRIGHT_DEV) return img;
+        } else {
+            mr = static_cast<float>(sgr / grayCount);
+            mg = static_cast<float>(sgg / grayCount);
+            mb = static_cast<float>(sgb / grayCount);
+            k = 0.70f;
+            float gmean = (mr + mg + mb) / 3.0f;
+            if (gmean < 5.0f) return img;
+            float gdev = std::max({std::abs(mr - gmean), std::abs(mg - gmean), std::abs(mb - gmean)});
+            if (gdev < WB_GRAY_DEV) return img;
+        }
     } else {
         mr = static_cast<float>(sr / n);
         mg = static_cast<float>(sg / n);
         mb = static_cast<float>(sb / n);
         k = 0.40f;  // fallback: weaker, because global means are untrusted
+        float fmean = (mr + mg + mb) / 3.0f;
+        if (fmean < 5.0f) return img;
+        float fdev = std::max({std::abs(mr - fmean), std::abs(mg - fmean), std::abs(mb - fmean)});
+        if (fdev < WB_FALLBACK_DEV) return img;
     }
 
     float mean = (mr + mg + mb) / 3.0f;
     if (mean < 5.0f) return img;
-    float dev = std::max({std::abs(mr - mean), std::abs(mg - mean), std::abs(mb - mean)});
-    if (dev < 8.0f) return img;  // neutrals show no cast: do not touch
 
     float gr = clampf(mean / std::max(1.0f, mr), 0.85f, 1.15f);
     float gg = clampf(mean / std::max(1.0f, mg), 0.85f, 1.15f);
@@ -365,16 +453,7 @@ cv::Mat whiteBalance(const cv::Mat &img, const Eval &ev) {
     return out;
 }
 
-// v2: dark-AND-flat mask, single-channel float in [0,1].
-// Dark  = luminance weight, full below 45, gone by 95 (the code's own
-//         dark<45 / shadow<80 vocabulary, made soft).
-// Flat  = local standard deviation of the LIGHTLY SMOOTHED luminance.
-//         The smoothing matters: raw grain would raise the local std and
-//         disqualify the very sky we want to treat. Measuring flatness
-//         after a radius-1.0 blur removes grain but keeps real structure
-//         (hair, edges, textures) visible to the std test.
-// Built at half resolution (the mask is smooth by construction) and
-// upsampled with bilinear interpolation, then feathered.
+// v2 dark-AND-flat mask (unchanged): the dark-area specialist.
 cv::Mat buildDarkFlatMask(const cv::Mat &img) {
     cv::Mat half;
     cv::resize(img, half,
@@ -413,13 +492,10 @@ cv::Mat buildDarkFlatMask(const cv::Mat &img) {
     return full;
 }
 
-// v2: treatment applied inside the mask only (see JNI section).
-// One blur-blend does two jobs: it denoises AND it applies negative
-// clarity (pulling pixels toward their local mean removes micro-contrast,
-// and grain IS micro-contrast). Chroma suppression then removes the
-// colored speckles and restores solid blacks. No extra black pull here:
-// tonalDepth's deepBlack already pulls deep blacks globally.
-cv::Mat darkFlatClean(const cv::Mat &img, const cv::Mat &mask) {
+// v2 dark-flat cleaning. v4.1: strength follows the measured noise gate t
+// (t = 0 on a clean photo -> returns the image untouched).
+cv::Mat darkFlatClean(const cv::Mat &img, const cv::Mat &mask, float t) {
+    if (t <= 0.001f) return img;
     cv::Mat blurred = gaussianBlurCustom(img, 2.0f);
     cv::Mat out(img.size(), CV_32FC3);
     const float* a = img.ptr<float>();
@@ -428,12 +504,12 @@ cv::Mat darkFlatClean(const cv::Mat &img, const cv::Mat &mask) {
     float* o = out.ptr<float>();
     int n = img.rows * img.cols;
     for (int i = 0; i < n; ++i) {
-        float s = m[i] * 0.55f;  // cleaning strength knob
+        float s = m[i] * 0.55f * t;  // cleaning strength knob (x noise gate)
         float r  = a[i * 3]     * (1.0f - s) + b[i * 3]     * s;
         float g  = a[i * 3 + 1] * (1.0f - s) + b[i * 3 + 1] * s;
         float bl = a[i * 3 + 2] * (1.0f - s) + b[i * 3 + 2] * s;
         float lum = 0.299f * r + 0.587f * g + 0.114f * bl;
-        float d = m[i] * 0.45f;  // chroma suppression knob
+        float d = m[i] * 0.45f * t;  // chroma suppression knob (x noise gate)
         o[i * 3]     = clampf(lum + (r - lum)  * (1.0f - d), 0.0f, 255.0f);
         o[i * 3 + 1] = clampf(lum + (g - lum)  * (1.0f - d), 0.0f, 255.0f);
         o[i * 3 + 2] = clampf(lum + (bl - lum) * (1.0f - d), 0.0f, 255.0f);
@@ -441,6 +517,350 @@ cv::Mat darkFlatClean(const cv::Mat &img, const cv::Mat &mask) {
     return out;
 }
 
+// --- v4 additions ---
+
+// Mean luminance on a small copy (<=640 max edge): sets the curve strength.
+float quickMeanLum(const cv::Mat &img) {
+    cv::Mat small = img;
+    int maxEdge = std::max(img.cols, img.rows);
+    if (maxEdge > 640) {
+        float s = 640.0f / maxEdge;
+        cv::resize(img, small,
+                   cv::Size(std::max(1, static_cast<int>(img.cols * s)),
+                            std::max(1, static_cast<int>(img.rows * s))),
+                   0, 0, cv::INTER_AREA);
+    }
+    int n = small.rows * small.cols;
+    const float* p = small.ptr<float>();
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i)
+        sum += 0.299 * p[i * 3] + 0.587 * p[i * 3 + 1] + 0.114 * p[i * 3 + 2];
+    return static_cast<float>(sum / n);
+}
+
+float curveStrengthFor(float meanLum) {
+    return clampf(CURVE_MIN_STRENGTH +
+                  (1.0f - CURVE_MIN_STRENGTH) * (meanLum - CURVE_DARK_LUM) /
+                  (CURVE_FULL_LUM - CURVE_DARK_LUM),
+                  CURVE_MIN_STRENGTH, 1.0f);
+}
+
+// Robust luma noise sigma (0..255 scale). Immerkaer Laplacian response,
+// averaged per 16x16-ish block; the 25th-percentile block (a flat one)
+// gives the noise floor: sigma = value * sqrt(pi/2) / 6.
+float estimateSigma(const cv::Mat &img) {
+    cv::Mat L = lumaOf(img);
+    cv::Mat kernel = (cv::Mat_<float>(3, 3) <<
+         1.0f, -2.0f,  1.0f,
+        -2.0f,  4.0f, -2.0f,
+         1.0f, -2.0f,  1.0f);
+    cv::Mat r;
+    cv::filter2D(L, r, CV_32F, kernel, cv::Point(-1, -1), 0, cv::BORDER_REPLICATE);
+    float* rp = r.ptr<float>();
+    int n = r.rows * r.cols;
+    for (int i = 0; i < n; ++i) rp[i] = std::abs(rp[i]);
+
+    int bw = std::max(1, L.cols / 16);
+    int bh = std::max(1, L.rows / 16);
+    cv::Mat rb;
+    cv::resize(r, rb, cv::Size(bw, bh), 0, 0, cv::INTER_AREA);
+    const float* rbp = rb.ptr<float>();
+    std::vector<float> v(rbp, rbp + bw * bh);
+    size_t k = (v.size() - 1) / 4;  // 25th percentile
+    std::nth_element(v.begin(), v.begin() + k, v.end());
+    return v[k] * 1.2533141f / 6.0f;  // sqrt(pi/2) / 6
+}
+
+static cv::Mat boxF(const cv::Mat &x, int k) {
+    cv::Mat d;
+    cv::boxFilter(x, d, -1, cv::Size(k, k), cv::Point(-1, -1), true, cv::BORDER_REPLICATE);
+    return d;
+}
+
+// Fast guided filter (He et al.). I = CV_32FC1 guide at full resolution,
+// p = CV_32FC1 or CV_32FC3 input. a,b are computed on a copy whose max
+// edge is scaleEdge (or full size when scaleEdge >= image size) and
+// applied at full resolution. Returns the same channel count as p.
+cv::Mat guidedFast(const cv::Mat &I, const cv::Mat &p, int r, float eps, int scaleEdge) {
+    int H = I.rows, W = I.cols;
+    float s = std::min(1.0f, static_cast<float>(scaleEdge) / static_cast<float>(std::max(H, W)));
+    int w2 = std::max(1, static_cast<int>(W * s));
+    int h2 = std::max(1, static_cast<int>(H * s));
+    bool scaled = (w2 != W || h2 != H);
+
+    cv::Mat Is;
+    if (scaled) cv::resize(I, Is, cv::Size(w2, h2), 0, 0, cv::INTER_AREA);
+    else Is = I;
+
+    int k = 2 * r + 1;
+    int n2 = w2 * h2;
+    cv::Mat IsSq(h2, w2, CV_32FC1);
+    {
+        const float* a = Is.ptr<float>();
+        float* o = IsSq.ptr<float>();
+        for (int i = 0; i < n2; ++i) o[i] = a[i] * a[i];
+    }
+    cv::Mat mI = boxF(Is, k);
+    cv::Mat mII = boxF(IsSq, k);
+    cv::Mat vI(h2, w2, CV_32FC1);
+    {
+        const float* m1 = mI.ptr<float>();
+        const float* m2 = mII.ptr<float>();
+        float* o = vI.ptr<float>();
+        for (int i = 0; i < n2; ++i) o[i] = m2[i] - m1[i] * m1[i];
+    }
+
+    std::vector<cv::Mat> chans;
+    cv::split(p, chans);
+    std::vector<cv::Mat> outs(chans.size());
+
+    for (size_t c = 0; c < chans.size(); ++c) {
+        cv::Mat ps;
+        if (scaled) cv::resize(chans[c], ps, cv::Size(w2, h2), 0, 0, cv::INTER_AREA);
+        else ps = chans[c];
+
+        cv::Mat Ip(h2, w2, CV_32FC1);
+        {
+            const float* a = Is.ptr<float>();
+            const float* b = ps.ptr<float>();
+            float* o = Ip.ptr<float>();
+            for (int i = 0; i < n2; ++i) o[i] = a[i] * b[i];
+        }
+        cv::Mat mp = boxF(ps, k);
+        cv::Mat mIp = boxF(Ip, k);
+
+        cv::Mat A(h2, w2, CV_32FC1), B(h2, w2, CV_32FC1);
+        {
+            const float* mi = mI.ptr<float>();
+            const float* mpp = mp.ptr<float>();
+            const float* mip = mIp.ptr<float>();
+            const float* vv = vI.ptr<float>();
+            float* ao = A.ptr<float>();
+            float* bo = B.ptr<float>();
+            for (int i = 0; i < n2; ++i) {
+                float cov = mip[i] - mi[i] * mpp[i];
+                float a = cov / (vv[i] + eps);
+                ao[i] = a;
+                bo[i] = mpp[i] - a * mi[i];
+            }
+        }
+        cv::Mat mA = boxF(A, k);
+        cv::Mat mB = boxF(B, k);
+        if (scaled) {
+            cv::Mat tA, tB;
+            cv::resize(mA, tA, cv::Size(W, H), 0, 0, cv::INTER_LINEAR);
+            cv::resize(mB, tB, cv::Size(W, H), 0, 0, cv::INTER_LINEAR);
+            mA = tA; mB = tB;
+        }
+        outs[c].create(H, W, CV_32FC1);
+        const float* ap = mA.ptr<float>();
+        const float* bp = mB.ptr<float>();
+        const float* ip = I.ptr<float>();
+        float* op = outs[c].ptr<float>();
+        int n = H * W;
+        for (int i = 0; i < n; ++i) op[i] = ap[i] * ip[i] + bp[i];
+    }
+
+    cv::Mat out;
+    cv::merge(outs, out);
+    return out;
+}
+
+// v4 luma denoise: classical non-local means on LUMA ONLY, strength from the
+// measured sigma; a uniform share of the original luma is kept (no
+// staircase artefacts) and real texture is re-injected where structure
+// exists. Fine chroma noise: small-radius luma-guided filter.
+cv::Mat nlmDenoise(const cv::Mat &img, float sigma) {
+    if (sigma < NLM_MIN_SIGMA) return img;  // clean photo: do not touch
+
+    int rows = img.rows, cols = img.cols, n = rows * cols;
+    float t = smoothstep01(sigma, 5.0f, 10.0f);   // 0 moderate noise .. 1 heavy noise
+    float h = clampf((NLM_H_K + 0.30f * t) * sigma, 1.5f, NLM_H_MAX);
+    float origKeep = NLM_ORIG_KEEP * (1.0f - 0.65f * t);
+
+    cv::Mat Y = lumaOf(img);
+    cv::Mat Yd(rows, cols, CV_32FC1);
+    if (n > NLM_MAX_PIXELS) {
+        // fast path for big photos: edge-preserving guided filter on luma
+        float e = 1.6f * sigma;
+        Yd = guidedFast(Y, Y, FAST_LUMA_RADIUS, e * e, 1 << 20);
+    } else {
+        cv::Mat Y8(rows, cols, CV_8UC1);
+        const float* yp = Y.ptr<float>();
+        uint8_t* y8 = Y8.ptr<uint8_t>();
+        for (int i = 0; i < n; ++i)
+            y8[i] = static_cast<uint8_t>(clampi(static_cast<int>(yp[i] + 0.5f), 0, 255));
+        cv::Mat D8;
+        cv::fastNlMeansDenoising(Y8, D8, h, 7, 21);
+        const uint8_t* d8 = D8.ptr<uint8_t>();
+        float* ydp = Yd.ptr<float>();
+        for (int i = 0; i < n; ++i) ydp[i] = static_cast<float>(d8[i]);
+    }
+
+    // structure map (where real texture exists)
+    cv::Mat Yb = gaussianBlurCustom(Y, 1.2f);
+    cv::Mat absd(rows, cols, CV_32FC1);
+    {
+        const float* a = Y.ptr<float>();
+        const float* b = Yb.ptr<float>();
+        float* o = absd.ptr<float>();
+        for (int i = 0; i < n; ++i) o[i] = std::abs(a[i] - b[i]);
+    }
+    cv::Mat structure = gaussianBlurCustom(absd, 1.5f);
+
+    cv::Mat chroma = chromaOf(img, Y);
+    cv::Mat cs = guidedFast(Y, chroma, 3, FINE_CHROMA_EPS, 1 << 20);
+
+    cv::Mat out(rows, cols, CV_32FC3);
+    const float* yp = Y.ptr<float>();
+    float* ydp = Yd.ptr<float>();
+    const float* stp = structure.ptr<float>();
+    const float* chp = chroma.ptr<float>();
+    const float* csp = cs.ptr<float>();
+    float* o = out.ptr<float>();
+    for (int i = 0; i < n; ++i) {
+        float y = yp[i];
+        float yd = ydp[i];
+        yd = yd + origKeep * (y - yd);
+        float keepW = NLM_TEXTURE_KEEP * smoothstep01(stp[i], 1.6f * sigma, 3.2f * sigma);
+        yd = yd + keepW * (y - yd);
+        for (int c = 0; c < 3; ++c) {
+            int idx = i * 3 + c;
+            float chr = chp[idx] * (1.0f - FINE_CHROMA_BLEND) + csp[idx] * FINE_CHROMA_BLEND;
+            o[idx] = clampf(yd + chr, 0.0f, 255.0f);
+        }
+    }
+    return out;
+}
+
+// v4: removes LARGE colour blotches only. Flattens the chroma band between a
+// mid scale and a big scale (both luma-guided, so luma edges are kept) and
+// leaves finer chroma detail alone. Strong deviations = real colour = kept.
+// v4.1: strength follows the measured noise gate t (0 = clean photo = skip).
+cv::Mat chromaBlotchClean(const cv::Mat &img, float t) {
+    if (t <= 0.001f) return img;
+    int n = img.rows * img.cols;
+    cv::Mat Y = lumaOf(img);
+    cv::Mat chroma = chromaOf(img, Y);
+    cv::Mat low = guidedFast(Y, chroma, GF_MID_RADIUS, GF_EPS, GF_SCALE_EDGE);
+    cv::Mat big = guidedFast(Y, chroma, GF_RADIUS, GF_EPS * 2.0f, GF_SCALE_EDGE);
+
+    cv::Mat out(img.size(), CV_32FC3);
+    const float* yp = Y.ptr<float>();
+    const float* chp = chroma.ptr<float>();
+    const float* lp = low.ptr<float>();
+    const float* bp = big.ptr<float>();
+    float* o = out.ptr<float>();
+    for (int i = 0; i < n; ++i) {
+        float b0 = lp[i * 3]     - bp[i * 3];
+        float b1 = lp[i * 3 + 1] - bp[i * 3 + 1];
+        float b2 = lp[i * 3 + 2] - bp[i * 3 + 2];
+        float dev = std::sqrt(b0 * b0 + b1 * b1 + b2 * b2);
+        float w = CH_STRENGTH * t * (1.0f - smoothstep01(dev, CH_DEV_LO, CH_DEV_HI));
+        o[i * 3]     = clampf(yp[i] + chp[i * 3]     - b0 * w, 0.0f, 255.0f);
+        o[i * 3 + 1] = clampf(yp[i] + chp[i * 3 + 1] - b1 * w, 0.0f, 255.0f);
+        o[i * 3 + 2] = clampf(yp[i] + chp[i * 3 + 2] - b2 * w, 0.0f, 255.0f);
+    }
+    return out;
+}
+
+// v4: halo-free local shadow lift. Only the guided BASE layer is lifted;
+// detail stays untouched and deep blacks (base < ~14) are never lifted.
+// v4.1: applied as a GAIN, so R:G:B ratios (saturation, warmth) are kept.
+cv::Mat localShadowLift(const cv::Mat &img) {
+    int n = img.rows * img.cols;
+    cv::Mat Y = lumaOf(img);
+    cv::Mat base = guidedFast(Y, Y, 8, 300.0f, 480);
+    cv::Mat out(img.size(), CV_32FC3);
+    const float* a = img.ptr<float>();
+    const float* bp = base.ptr<float>();
+    float* o = out.ptr<float>();
+    for (int i = 0; i < n; ++i) {
+        float b = bp[i];
+        float tt = clampf(b / 255.0f, 0.0f, 1.0f);
+        float lifted = 255.0f * std::pow(tt, LIFT_GAMMA);
+        float gate = smoothstep01(b, 14.0f, 44.0f) * (1.0f - smoothstep01(b, 105.0f, 175.0f));
+        float base2 = b + LIFT_STRENGTH * gate * (lifted - b);
+        float f = clampf(base2 / std::max(b, 1.0f), 1.0f, 1.6f);
+        o[i * 3]     = clampf(a[i * 3]     * f, 0.0f, 255.0f);
+        o[i * 3 + 1] = clampf(a[i * 3 + 1] * f, 0.0f, 255.0f);
+        o[i * 3 + 2] = clampf(a[i * 3 + 2] * f, 0.0f, 255.0f);
+    }
+    return out;
+}
+
+// v4.1: two-sided saturation anchor. Compares the mid-tone chroma-to-luma
+// of the output with the pre-cleaning image (both low-passed so noise does
+// not inflate it) and rescales chroma about luma by ONE global factor so
+// the result lands at ~RESTORE_TARGET x the original. Hue is never changed.
+cv::Mat chromaRestore(const cv::Mat &out, const cv::Mat &ref) {
+    int n = out.rows * out.cols;
+    cv::Mat Yo = lumaOf(out);
+    cv::Mat Yr = lumaOf(ref);
+    cv::Mat co = gaussianBlurCustom(chromaOf(out, Yo), 8.0f);
+    cv::Mat cr = gaussianBlurCustom(chromaOf(ref, Yr), 8.0f);
+    cv::Mat yo = gaussianBlurCustom(Yo, 8.0f);
+    cv::Mat yr = gaussianBlurCustom(Yr, 8.0f);
+    const float* cop = co.ptr<float>();
+    const float* crp = cr.ptr<float>();
+    const float* yop = yo.ptr<float>();
+    const float* yrp = yr.ptr<float>();
+    std::vector<float> ratios;
+    ratios.reserve(n / 4 + 1);
+    for (int i = 0; i < n; i += 4) {  // every 4th pixel is plenty for a median
+        float so = std::sqrt(cop[i * 3] * cop[i * 3] + cop[i * 3 + 1] * cop[i * 3 + 1] +
+                             cop[i * 3 + 2] * cop[i * 3 + 2]) / std::max(yop[i], 10.0f);
+        float sr = std::sqrt(crp[i * 3] * crp[i * 3] + crp[i * 3 + 1] * crp[i * 3 + 1] +
+                             crp[i * 3 + 2] * crp[i * 3 + 2]) / std::max(yrp[i], 10.0f);
+        if (yrp[i] > 40.0f && yrp[i] < 215.0f && sr > 0.03f) ratios.push_back(so / sr);
+    }
+    if (ratios.size() < 500) return out;  // not enough mid-tone colour
+    size_t mid = ratios.size() / 2;
+    std::nth_element(ratios.begin(), ratios.begin() + mid, ratios.end());
+    float ratio = ratios[mid];
+    float k = clampf(RESTORE_TARGET / std::max(ratio, 1e-3f), RESTORE_MIN, RESTORE_MAX);
+    if (std::abs(k - 1.0f) < 0.0005f) return out;
+
+    cv::Mat res(out.size(), CV_32FC3);
+    const float* a = out.ptr<float>();
+    const float* y = Yo.ptr<float>();
+    float* o = res.ptr<float>();
+    for (int i = 0; i < n; ++i) {
+        o[i * 3]     = clampf(y[i] + (a[i * 3]     - y[i]) * k, 0.0f, 255.0f);
+        o[i * 3 + 1] = clampf(y[i] + (a[i * 3 + 1] - y[i]) * k, 0.0f, 255.0f);
+        o[i * 3 + 2] = clampf(y[i] + (a[i * 3 + 2] - y[i]) * k, 0.0f, 255.0f);
+    }
+    return res;
+}
+
+// v4: SUPPRESSION mask for clarity / micro-detail / sharpening, CV_32FC1 in
+// [0,1]. 0 = sharpen freely (real structure well above the measured noise),
+// 1 = do not sharpen (flat/noisy zone, or inside the dark-flat mask).
+cv::Mat buildSharpMask(const cv::Mat &img, float sigma, const cv::Mat &darkMask) {
+    int n = img.rows * img.cols;
+    cv::Mat L = lumaOf(img);
+    cv::Mat Lb = gaussianBlurCustom(L, 1.2f);
+    cv::Mat d(img.rows, img.cols, CV_32FC1);
+    {
+        const float* a = L.ptr<float>();
+        const float* b = Lb.ptr<float>();
+        float* o = d.ptr<float>();
+        for (int i = 0; i < n; ++i) o[i] = std::abs(a[i] - b[i]);
+    }
+    cv::Mat structure = gaussianBlurCustom(d, 1.5f);
+    float sg = std::max(sigma * 0.5f, 0.8f);
+    cv::Mat mask(img.rows, img.cols, CV_32FC1);
+    const float* st = structure.ptr<float>();
+    const float* dm = darkMask.ptr<float>();
+    float* o = mask.ptr<float>();
+    for (int i = 0; i < n; ++i) {
+        float gain = smoothstep01(st[i], STRUCT_LO * sg, STRUCT_HI * sg) * (1.0f - dm[i]);
+        o[i] = 1.0f - gain;
+    }
+    return mask;
+}
+
+// Clarity: strength scaled per pixel by (1 - mask).
 cv::Mat clarityBoost(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
     cv::Mat blurred = gaussianBlurCustom(img, 3.0f);
     float strength = 0.055f; // NATURAL mode
@@ -464,13 +884,15 @@ cv::Mat clarityBoost(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
     return out;
 }
 
-cv::Mat microDetail(const cv::Mat &img, const Eval &ev) {
+// Micro-detail: own Laplacian edge mask, additionally scaled by (1 - mask).
+cv::Mat microDetail(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
     cv::Mat blurred = gaussianBlurCustom(img, 1.0f);
     cv::Mat grayEdges = findEdgesFromL(img);
 
     int n = img.rows * img.cols;
     std::vector<float> edgeMask(n);
     const float* geP = grayEdges.ptr<float>();
+    const float* mkP = mask.ptr<float>();
     for (int i = 0; i < n; ++i) {
         edgeMask[i] = clampf((geP[i] / 255.0f - 0.08f) * 3.0f, 0.0f, 1.0f);
     }
@@ -485,7 +907,7 @@ cv::Mat microDetail(const cv::Mat &img, const Eval &ev) {
     float* o = out.ptr<float>();
 
     for (int i = 0; i < n; ++i) {
-        float m = edgeMask[i];
+        float m = edgeMask[i] * (1.0f - mkP[i]);
         for (int c = 0; c < 3; ++c) {
             int idx = i * 3 + c;
             float detail = clampf(a[idx] - b[idx], -18.0f, 18.0f);
@@ -495,20 +917,25 @@ cv::Mat microDetail(const cv::Mat &img, const Eval &ev) {
     return out;
 }
 
-cv::Mat pilContrast(const cv::Mat &img, float factor) {
+// Contrast around the image mean with modulated push (v3, unchanged).
+cv::Mat pilContrastMod(const cv::Mat &img, float factor, float darkScale, float brightCap) {
     int px = img.rows * img.cols;
     const float* a = img.ptr<float>();
-
     double sum = 0.0;
     for (int i = 0; i < px; ++i) {
         sum += 0.299 * a[i * 3] + 0.587 * a[i * 3 + 1] + 0.114 * a[i * 3 + 2];
     }
     float mean = clampf(static_cast<float>(sum / px), 0.0f, 255.0f);
-
     cv::Mat out(img.size(), CV_32FC3);
     float* o = out.ptr<float>();
-    for (int i = 0; i < px * 3; ++i) {
-        o[i] = clampf(mean * (1.0f - factor) + a[i] * factor, 0.0f, 255.0f);
+    for (int i = 0; i < px; ++i) {
+        float lum = 0.299f * a[i * 3] + 0.587f * a[i * 3 + 1] + 0.114f * a[i * 3 + 2];
+        float f = (lum < mean) ? (1.0f + (factor - 1.0f) * darkScale)
+                               : (1.0f + (factor - 1.0f) * brightCap);
+        for (int c = 0; c < 3; ++c) {
+            int idx = i * 3 + c;
+            o[idx] = clampf(mean * (1.0f - f) + a[idx] * f, 0.0f, 255.0f);
+        }
     }
     return out;
 }
@@ -521,10 +948,12 @@ cv::Mat adaptiveContrast(const cv::Mat &img, const Eval &ev) {
 
     factor = 1.0f + (factor - 1.0f) * 0.82f; // NATURAL
     if (factor <= 1.001f) return img;
-    return pilContrast(img, factor);
+    float darkScale = clampf(ev.brightness / CONTRAST_DARK_REF, CONTRAST_DARK_FLOOR, 1.0f);
+    return pilContrastMod(img, factor, darkScale, CONTRAST_BRIGHT_CAP);
 }
 
 cv::Mat colorDepth(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
+    (void)ev;
     int px = img.rows * img.cols;
     const float* a = img.ptr<float>();
 
@@ -556,11 +985,11 @@ cv::Mat colorDepth(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
         auto [h, s, v] = hsv[i];
         float protection = clampf((v / 255.0f - 0.68f) / 0.32f, 0.0f, 1.0f);
         float effective = boost * (1.0f - protection * 0.60f);
-        effective *= (1.0f - (s / 255.0f) * 0.65f);  // (a) vibrance
+        effective *= (1.0f - (s / 255.0f) * 0.65f);  // vibrance
         bool skinHue = (h <= 28.0f || h >= 240.0f);
         if (skinHue && s >= 30.0f && s <= 200.0f && v >= 60.0f && v <= 240.0f)
-            effective *= 0.45f;  // (b) skin guard
-        effective *= (1.0f - m[i]);  // (c) mask gate
+            effective *= 0.45f;  // skin guard
+        effective *= (1.0f - m[i]);  // dark-flat gate
 
         float newS = clampf(s * (1.0f + effective), 0.0f, 255.0f);
 
@@ -580,7 +1009,7 @@ cv::Mat tonalDepth(const cv::Mat &img, const Eval &ev) {
 
     float shadow = 0.015f;   // NATURAL
     float highlight = 0.010f;
-    float blackPull = 0.018f;
+    float blackPull = 0.018f * clampf(ev.brightness / DEEPBLACK_REF, DEEPBLACK_FLOOR, 1.0f);
 
     if (ev.shadowRatio > 0.18f) {
         shadow *= std::min(1.0f, ev.shadowRatio / 0.32f);
@@ -704,14 +1133,9 @@ cv::Mat highlightSafety(const cv::Mat &img, const cv::Mat &original) {
     return out;
 }
 
-// --- v2.1 Addition: user curve pre-stage ---
-// The user's own "wave" curve from his Snapseed screenshot (RGB master
-// channel), control points (0,0) (59,44) (129,133) (208,208) (255,255).
-// Gentle S-curve: shadows darkened (max -15), midtones lifted slightly
-// (+4), highlights identity. LUT built with monotone cubic (PCHIP)
-// interpolation and verified non-decreasing, so tones never invert.
-// Master curve: same LUT on R, G and B — no hue shift.
-// Called at the very start of nativeEnhance(), BEFORE evaluate().
+// --- User curve pre-stage (points unchanged since v2.1) ---
+// Control points (0,0) (59,44) (129,133) (208,208) (255,255), PCHIP LUT,
+// non-decreasing, same LUT on R, G, B (no hue shift).
 
 static const uint8_t CURVE_LUT[256] = {
     0, 1, 1, 2, 3, 4, 4, 5, 6, 6, 7, 8, 9, 9, 10, 11,
@@ -732,8 +1156,8 @@ static const uint8_t CURVE_LUT[256] = {
     240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255,
 };
 
-// Apply the master curve to a CV_32FC3 image with values in 0..255.
-cv::Mat applyCurve(const cv::Mat &img) {
+// out = in + strength * (LUT[in] - in); strength 1.0 = the full curve.
+cv::Mat applyCurve(const cv::Mat &img, float strength) {
     cv::Mat out(img.size(), CV_32FC3);
     const float* a = img.ptr<float>();
     float* o = out.ptr<float>();
@@ -741,7 +1165,7 @@ cv::Mat applyCurve(const cv::Mat &img) {
     for (int i = 0; i < px; ++i) {
         int idx = static_cast<int>(a[i] + 0.5f);
         idx = std::max(0, std::min(255, idx));
-        o[i] = static_cast<float>(CURVE_LUT[idx]);
+        o[i] = a[i] + strength * (static_cast<float>(CURVE_LUT[idx]) - a[i]);
     }
     return out;
 }
@@ -797,16 +1221,16 @@ Java_com_master_aistudio_utils_NativeSmartEnhancer_nativeEnhance(
         jobject thiz,
         jobject srcBitmap,
         jobject dstBitmap) {
+    (void)thiz;
 
     cv::Mat work;
     bitmapToFloatRgb(env, srcBitmap, work);
 
-    // 0. v2.1 user curve pre-stage: applied BEFORE evaluate(), so the
-    // pipeline measures the curved input — exactly the tested workflow
-    // (curve-adjusted image saved, then passed through native).
-    work = applyCurve(work);
+    // 0. Adaptive user curve (strength measured from the photo).
+    float preLum = quickMeanLum(work);
+    work = applyCurve(work, curveStrengthFor(preLum));
 
-    // 1. Evaluate on 1280 max edge preview if larger
+    // 1. Evaluate on a 1280 max-edge preview if larger.
     cv::Mat evalSrc = work;
     int maxEdge = std::max(work.cols, work.rows);
     if (maxEdge > 1280) {
@@ -815,23 +1239,32 @@ Java_com_master_aistudio_utils_NativeSmartEnhancer_nativeEnhance(
         int nh = std::max(1, static_cast<int>(work.rows * scale));
         cv::resize(work, evalSrc, cv::Size(nw, nh), 0, 0, cv::INTER_AREA);
     }
-
     Eval ev = evaluate(evalSrc);
 
-    // 2. Pipeline Execution (v2 order)
-    cv::Mat out = gentleDenoise(work, ev);
-    out = whiteBalance(out, ev);                 // v2 NEW
-    cv::Mat darkMask = buildDarkFlatMask(out);   // v2 NEW
-    out = darkFlatClean(out, darkMask);          // v2 NEW
-    out = clarityBoost(out, ev, darkMask);       // v2 signature
-    out = microDetail(out, ev);                  // unchanged
-    out = adaptiveContrast(out, ev);             // unchanged
-    out = colorDepth(out, ev, darkMask);         // v2 signature
-    out = tonalDepth(out, ev);                   // unchanged
-    out = crystalSharpen(out, ev, darkMask);     // v2 signature
-    out = fineCrisp(out, ev, darkMask);          // v2 signature
-    out = highlightSafety(out, work);            // unchanged
+    // 2. Pipeline (v4.1 order).
+    cv::Mat out = whiteBalance(work, ev);
+    cv::Mat ref = out;                                // v4.1: colour reference for chromaRestore
+    float sigma = estimateSigma(out);                 // v4: measured noise level
+    float noiseGate = smoothstep01(sigma, CHROMA_GATE_LO, CHROMA_GATE_HI);  // v4.1
+    if (!ev.isGraphic) {
+        out = nlmDenoise(out, sigma);                 // v4: luma NLM + fine chroma
+        out = chromaBlotchClean(out, noiseGate);      // v4.1: gated by measured noise
+    }
+    cv::Mat darkMask = buildDarkFlatMask(out);        // unchanged
+    out = darkFlatClean(out, darkMask, noiseGate);    // v4.1: gated by measured noise
+    out = localShadowLift(out);                       // v4.1: multiplicative lift
+    float sigma2 = estimateSigma(out);                // residual noise after cleaning
+    cv::Mat sharpMask = buildSharpMask(out, sigma2, darkMask);  // v4
+    out = clarityBoost(out, ev, sharpMask);
+    out = microDetail(out, ev, sharpMask);
+    out = adaptiveContrast(out, ev);
+    out = colorDepth(out, ev, darkMask);
+    out = tonalDepth(out, ev);
+    out = crystalSharpen(out, ev, sharpMask);
+    out = fineCrisp(out, ev, sharpMask);
+    if (!ev.isGraphic) out = chromaRestore(out, ref); // v4.1: saturation anchor
+    out = highlightSafety(out, work);
 
-    // 3. Render back to Bitmap
+    // 3. Render back to Bitmap.
     floatRgbToBitmap(env, out, dstBitmap);
 }
