@@ -1,4 +1,3 @@
-// ============================================================================
 // smart_enhancer.cpp — v4.1 (COMPLETE FILE, ready to paste as-is)
 // Classical methods only: OpenCV filters + non-local means (a fixed
 // mathematical algorithm). NO neural networks, NO models, NO new libraries
@@ -91,7 +90,7 @@ static const float CH_STRENGTH = 0.92f;
 static const float CHROMA_GATE_LO = 1.5f;       // v4.1: sigma where chroma cleaning starts
 static const float CHROMA_GATE_HI = 4.0f;       // v4.1: sigma where it is fully on
 static const float RESTORE_MIN = 0.90f;         // v4.1: chromaRestore bounds
-static const float RESTORE_MAX = 1.13f;
+static const float RESTORE_MAX = 1.12f;
 static const float RESTORE_TARGET = 1.03f;
 static const float LIFT_STRENGTH = 0.30f;
 static const float LIFT_GAMMA = 0.78f;
