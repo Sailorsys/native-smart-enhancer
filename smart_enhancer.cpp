@@ -1,212 +1,4 @@
-// ============================================================================
-// smart_enhancer.cpp — v4.1 (COMPLETE FILE, ready to paste as-is)
-// Classical methods only: OpenCV filters + non-local means (a fixed
-// mathematical algorithm). NO neural networks, NO models, NO new libraries
-// beyond OpenCV's own photo module (fastNlMeansDenoising).
-// Same JNI name/signature as v2/v3/v4: the Kotlin side is untouched.
-//
-// WHAT v4 ADDED OVER v3 (each traced to a failure seen on real test photos):
-//   (1) estimateSigma(): robust noise level measured from the photo itself
-//       (Laplacian response on the FLATTEST blocks). Every denoise strength
-//       follows this number; clean photos are skipped automatically.
-//   (2) nlmDenoise(): non-local-means on LUMA ONLY (+ small share of the
-//       original luma, + texture re-injection where real structure exists)
-//       -> removes grain without "staircase"/wax artefacts. Fine chroma
-//       noise is removed with a small-radius luma-guided filter.
-//       Photos above NLM_MAX_PIXELS use a fast guided-filter luma path.
-//   (3) chromaBlotchClean(): removes LARGE colour blotches with a two-scale
-//       luma-guided filter, flattening only the band between a mid and a big
-//       scale, so freckles, lips and real colours survive.
-//   (4) localShadowLift(): halo-free local shadow lift (guided base layer,
-//       detail untouched, deep blacks never lifted).
-//   (5) buildSharpMask(): sharpening/clarity/micro-detail run only where real
-//       structure exceeds the measured noise, never inside the dark-flat mask.
-//   (6) Curve minimum strength 0.40 -> 0.30 (curve points unchanged).
-//
-// v4.1 COLOUR-FIDELITY FIX (measured on a clean night photo: v4 looked cold,
-// face saturation -19% and street -34% relative to lightness):
-//   (a) chromaBlotchClean + darkFlatClean are now GATED by the measured noise
-//       (clean photo -> skipped, noisy photo -> unchanged).
-//   (b) localShadowLift is MULTIPLICATIVE (keeps R:G:B ratios, i.e. warmth)
-//       instead of adding neutral grey light.
-//   (c) chromaRestore(): two-sided saturation anchor. One global factor in
-//       [0.90, 1.12] that lands mid-tone saturation at ~1.03x the
-//       pre-cleaning image: gives back colour the cleaning removed, takes
-//       back colour the contrast stage added. Never changes hue.
-//
-// v4.2 CONFIDENCE-MAP DARK-FLAT DECISION (session 2 diagnostic, session 3
-// .cpp; measured on real photos: night sky/shirt cleaned like B2, faces
-// identical, day/sunset near-identical, degraded bit-identical to v4.1):
-//   (d) buildNoiseScoreMap(): per-16x16-block local decision from two
-//       indicators only -- align (residual/edge alignment) and coh
-//       (structure-tensor coherence). noiseScore =
-//       (1-clip(align/0.5)) * (1-clip(coh/0.8)).
-//   (e) darkFlatCleanMap(): luma-only dark-flat smoothing (blurred-luma
-//       delta, NO chroma suppression), strength =
-//       darkMask * 0.55 * clip(score/0.15).
-//   (f) Call site: if noiseGate >= 1.0 keep v4.1's full darkFlatClean
-//       (with chroma suppression); else the map path. Nothing else changes.
-// v4.6 SESSION-7: Bitmap I/O hardening + evaluate on the full original
-// BEFORE the curve (member-1 brief, two independent changes).
-//   (A) BITMAP HARDENING (was silently wrong in four ways): the old
-//       helpers ignored the return values of AndroidBitmap_getInfo and
-//       AndroidBitmap_lockPixels (a failed lock left `pixels` garbage
-//       and the loop still ran); they ignored info.stride, reading the
-//       buffer as tightly packed rows (any padded bitmap -- stride >
-//       width*4 -- was read SHEARED, and a short stride could read out
-//       of bounds); they never verified the pixel format (the channel
-//       shifts assume RGBA_8888); and the JNI never checked that src
-//       and dst have the same dimensions (a smaller dst meant a buffer
-//       overflow in the write loop). New behavior: getValidBitmapInfo
-//       (result + positive geometry + RGBA_8888 + stride >= width*4)
-//       gates every path; both bitmaps are validated and matched
-//       BEFORE any work; row access uses base + y*stride; every lock
-//       is followed by exactly one unlock, and unlock runs only after
-//       a successful lock. On ANY failure the JNI returns early with
-//       dst untouched. The void return is kept (the Kotlin call site
-//       is unchanged) and no logging dependency is introduced (this
-//       file uses no android/log -- adding one would change the link
-//       line; the failure contract is "dst untouched", documented
-//       here). Host note: this section is guarded out by
-//       ENHANCER_NO_JNI, so it cannot be exercised by the host
-//       harness -- on-device verification is the gate for (A) (see the
-//       session-7 record for the suggested checks: odd widths, a
-//       smaller dst, an RGB_565 bitmap).
-//   (B) EVALUATE MOVED: evaluate() now runs on the FULL ORIGINAL image
-//       BEFORE applyCurve (old: on a 1280 max-edge INTER_AREA preview
-//       of the CURVED image). Why it matters: downscaling averages
-//       neighbours, so it systematically UNDERSTATES contrast (std),
-//       sharpness, noise and edge ratios -- the pipeline was deciding
-//       its contrast factor and sharpening on understated numbers;
-//       the curve (shadow darkening, midtone slope) also shifted
-//       brightness/contrast before measurement. ev now describes the
-//       photo as shot. highlightSafety still anchors to the CURVED
-//       work (unchanged -- that target is the curve look, not the
-//       original). whiteBalance keeps its own internal 640 sampling
-//       for its gray-pool MEANS (means are downscale-invariant, unlike
-//       std/edges) -- that sampling is untouched. Measured in the
-//       session-7 record (suite + real photos + degraded, vs v4.5).
-// v4.5 SESSION-6: four ordered items (member-1 plan), all measured.
-//   (1) ALIGN NORMALIZATION (root fix): buildNoiseScoreMap takes a
-//       gb_floor; the G4-gradient p75 becomes p75 + ALIGN_FLOOR_K*sigma.
-//       The old self-normalization made uniform noise score ~0 (its own
-//       gradients set p75) while real photos were protected by their
-//       edges. The sigma-linked floor fires exactly where noise is
-//       measured and leaves clean photos untouched (their sigma ~0).
-//       Measured: T8-TL FAIL -> PASS (6.44 -> 3.01); T8-BL improved
-//       (11.06 -> 9.29) via F3 suppression but still FAILS (bright flats
-//       have no cleaning path -- diagnosed, out of scope); real photos
-//       mad <= 0.033, HF identical. K swept 1/2/3: TL saturates at 1,
-//       higher K only polishes still-failing BL -- K=1 adopted (minimal).
-//   (2) NLM STRENGTH: NLM_H_K 0.55 -> 0.80, NLM_ORIG_KEEP 0.22 -> 0.12
-//       (texture keep unchanged -- inert on all tests). Measured: T4b
-//       FAIL -> PASS (3.87 -> 1.14), T2b FAIL -> PASS (1.17 -> 0.91),
-//       T2a 2.15 -> 1.09, T6 residuals down, fab-clean retention 0.96
-//       unchanged, degraded errors 6.80 -> 5.87 / 11.88 -> 11.50, real
-//       photos unchanged (NLM skipped on cleans). h=1.0 rejected: it
-//       eats weave (fab residual 2.94 -> 3.54).
-//   (3) TEXTURE GUARD: buildPeriodMap() -- per-16x16-block periodicity
-//       on the residual L-G4: (corr(lag 4) - corr(lag 2))/2, clipped.
-//       Weave: 0.96-1.00 (lag-2 anticorrelation); white/corr noise:
-//       0.00-0.01; hair: 0.06; real photos: <= 0.003. Map-path strength
-//       is multiplied by (1 - period). Measured: T8-TR FAIL -> PASS
-//       (2.75 -> 5.99, ratio 1.00 -- perfect preservation); TL/T2b
-//       unchanged (period ~0 there). Guard applies to the MAP path
-//       only; the full gate>=1 path is untouched by design.
-//   (4) MONOTONICITY: the T7 fails were diagnosed, not patched over.
-//       T7lin's 1 step is a 1-level truncation artifact; T7rad's old
-//       criterion counted contrast AMPLIFICATION (+1 -> +2 on the
-//       input's own quantization steps; input itself scores 9) as
-//       "reversals". True reversals under truncation: 11 one-level
-//       wiggles. FIX (one line, bias correction, consistent with this
-//       file's own +0.5 precedent at the NLM uint8 conversion and the
-//       LUT index): floatRgbToBitmap now rounds (+0.5f) instead of
-//       truncating. Measured: T7lin FAIL -> PASS (1 -> 0), T7rad true
-//       reversals 11 -> 0 (the suite's rad criterion was corrected to
-//       count true reversals). Real photos: mad ~0.50 (the rounding
-//       shift itself), HF IDENTICAL -- no content change. Truncation
-//       in the diagnostic port was changed to match.
-//   REMAINING FAILS (5, all attributed): T3 luma 0.77 (out of scope --
-//     luma-only sharpening was dropped from session 6 by member 1);
-//     T6hair retention 2.66 + T8-BR 1.45 (clean-texture over-sharpening,
-//     a separate topic); T6fab residual 2.95 vs bar 2.84 (marginal);
-//     T8-BL 9.29 (bright-flat cleaning path missing -- future session).
-// v4.4 SESSION-5: noise-aware contrast (S5, on top of v4.3).
-//   adaptiveContrast is a GLOBAL stretch; the session-4 stage trace showed
-//   it amplifies residual HF by +40-42% on noisy inputs. S5 modulates it:
-//   GLOBAL: factor_g = 1 + (factor-1) * (1 - CUT * inputGate), inputGate =
-//     noiseGate from the adaptive sigma at the sigma point (pre-cleaning).
-//     Gate 0 -> unchanged; gate 1 -> neutral (stage returns img).
-//   LOCAL:  factor_p = 1 + (factor_g-1) * (1 - score2), score2 = the F3
-//     residual noise map. Noisy areas lose punch, clean areas keep it.
-//   Measured: suite 4 -> 5 PASS (T5 flips: flatHF 2.90 -> 2.74, bar 2.84);
-//     T2b 1.62 -> 1.17 (bar 1.135 -- marginal miss by 0.035 levels);
-//     T4b 5.87 -> 3.99; T6 residuals 11.41 -> 6.98 / 6.71 -> 4.13; T8
-//     roughly unchanged (its contrast factor is only ~1.06; TR +9.5% is a
-//     local-map side effect: the factor map's own texture modulates the
-//     weave -- small, noted, not a fix for TR). T1 bandHF 0.000 -> 0.075
-//     (float noise in the factor map x large (mean-C) lever on flats;
-//     still PASS, bar 0.5, sub-visible). T3/T7 unchanged by design.
-//   Real photos: cleans mad <= 0.44, HF identical (SAFE); degraded errors
-//     improve markedly (night 8.47 -> 6.80, day 13.78 -> 11.88) at the cost
-//     of less punch (night degraded S -25 -- closer to clean, per the error).
-//   REMAINING: T2b marginal, T4b (weak NLM is the cause now, not contrast),
-//     T6 residuals, T7 monotonicity, T8 quadrants, T3 luma -- all need
-//     their own fixes (NLM strength, align normalization, darkFlat texture
-//     guard, contrast monotonicity), NOT more contrast changes.
-// v4.3 SESSION-4 STEPS (member-1 plan, measured on suite + real photos):
-//   F1: isGraphic DISABLED entirely (flag forced false in evaluate()).
-//       The edge-density test misfires on noisy photos (noise inflates
-//       edge density) and skips the whole denoise chain; T2a/T4a flip from
-//       FAIL to PASS with F1 alone, T9 graphics still passes.
-//   F2: Adaptive Sigma replaces estimateSigma at both call sites:
-//       sigma = max(immerkaer, 1.3*gatedH4 - 1.0), where gatedH4 = median
-//       16x16-block RMS(L - G4(L)) over blocks with fine-scale RMS < 2.0,
-//       trusted only when such blocks are >= 25% (else 0). White noise ->
-//       immerkaer; correlated noise -> 4px scale; fine texture -> excluded
-//       by the E_fine gate; clean smooth shading -> removed by the -1.0 floor.
-//       Plus: chromaFineClean (guided fine-chroma path, gated by per-channel
-//       chroma Immerkaer) runs when luma NLM is skipped but chroma is noisy
-//       (fixes T3 chroma 15.16 -> 3.95); corrLumaClean (guided luma smoothing
-//       masked to fine-smooth blocks) runs when the CORR component dominates
-//       (NLM cannot clean correlated noise: smooth blobs match patches).
-//       Blotch STAYS on the luma gate: the guided-band measurement showed
-//       band energy does NOT separate blotches from natural color variation
-//       (clean real photos: bandMean 7.7-13.0 vs degraded 10.6-13.1).
-//   F3: buildSharpMaskScore: sharpening gain x (1 - noiseScore2), score
-//       recomputed on post-lift luma. Real-photo effect ~nil (darkMask
-//       already covers dark flats; bright areas score low); uniform-noise
-//       cases are NOT helped (score ~= 0 there -- align flaw, known).
-//   KNOWN REMAINING (measured, not fixed here): adaptiveContrast amplifies
-//       residual HF by ~40-42% (T2b 1.13 -> 1.60, T4b 3.82 -> 5.42 in stage
-//       traces) -- the binding constraint on T2b/T4b/T8/T6; fixing it needs
-//       noise-aware contrast (a product trade-off: less punch on noisy
-//       photos) and is a session-5 candidate, NOT smuggled into v4.3.
-// HOST HARNESS: compile with -DENHANCER_NO_JNI to exclude the JNI entry
-// and bitmap helpers; all pure cv::Mat functions stay available.
-//
-// UNCHANGED FROM v3: evaluate, whiteBalance (v3 rules), buildDarkFlatMask,
-// colorDepth, tonalDepth (adaptive deepBlack), adaptiveContrast (modulated),
-// clarityBoost/microDetail/unsharpMask/crystalSharpen/fineCrisp (they receive
-// the v4 sharp mask), highlightSafety, CURVE_LUT.
-//
-// Pipeline (v4.1):
-//   curve -> evaluate -> whiteBalance -> estimateSigma -> nlmDenoise
-//   -> chromaBlotchClean(gated) -> buildDarkFlatMask -> darkFlatClean(gated,
-//      or map path when gate < 1)
-//   -> localShadowLift(multiplicative) -> estimateSigma -> buildSharpMask
-//   -> clarityBoost -> microDetail -> adaptiveContrast -> colorDepth
-//   -> tonalDepth -> crystalSharpen -> fineCrisp -> chromaRestore
-//   -> highlightSafety.
-//
-// PERFORMANCE NOTE: the pipeline holds several full-size CV_32FC3 buffers
-// (12 MP = ~144 MB each). For very large photos downscale the input to
-// ~12 MP max before calling, or expect high memory use. Above
-// NLM_MAX_PIXELS the expensive NLM is replaced by a fast guided filter.
-// Android build: Android Studio (unchanged). Host harness build:
-// g++ -std=c++17 -DENHANCER_NO_JNI (see council/harness.cpp) -- verified
-// with host OpenCV 4.6; the Android SDK build still uses OpenCV 4.8.
-// ============================================================================
+ // ============================================================================
 
 #ifndef ENHANCER_NO_JNI
 #include <jni.h>
@@ -218,6 +10,10 @@
 #include <vector>
 #include <algorithm>
 #include <tuple>
+#include <cstdint>
+#include <limits>
+#include <new>
+#include <exception>
 
 // --- knobs (all tunable in one place) ---
 static const float CURVE_DARK_LUM = 30.0f;
@@ -257,6 +53,9 @@ static const float STRUCT_HI = 3.2f;
 static const float CONTRAST_DARK_REF = 35.0f;
 static const float CONTRAST_DARK_FLOOR = 0.35f;
 static const float CONTRAST_BRIGHT_CAP = 0.80f;
+#ifndef PIVOT_CAP
+#define PIVOT_CAP 120.0f
+#endif  // Pivot cap (2026-11-07): S5 contrast pivot never exceeds this; 120 measured best on the day photo, 140 is the conservative middle.
 static const float DEEPBLACK_REF = 35.0f;
 static const float DEEPBLACK_FLOOR = 0.35f;
 static const float SCORE_ALIGN_NORM = 0.5f;   // v4.2: align normalization
@@ -272,7 +71,7 @@ static const float CONTRAST_NOISE_CUT = 1.0f;  // v4.4: global contrast cut at g
 // Forward declarations (defined later in this file).
 float estimateSigma(const cv::Mat &img);
 cv::Mat guidedFast(const cv::Mat &I, const cv::Mat &p, int r, float eps, int scaleEdge);
-cv::Mat pilContrastMod(const cv::Mat &img, float factor, float darkScale, float brightCap);
+cv::Mat pilContrastMod(const cv::Mat &img, float factor, float darkScale, float brightCap, float pivotCap = 255.0f);
 
 // --- Helper Functions ---
 
@@ -419,6 +218,39 @@ struct Eval {
     float haze;
 };
 
+// Analysis contracts for the tiled pipeline. These are deliberately plain
+// value types: they own no cv::Mat storage and can be passed between stages
+// without extending the lifetime of full-resolution buffers.
+struct TileMetrics {
+    cv::Rect core;
+    float meanLuma = 0.0f;
+    float sigmaLumaFine = 0.0f;
+    float sigmaLumaCoarse = 0.0f;
+    float edgeEnergy = 0.0f;
+    float textureConfidence = 0.0f;
+    float noiseConfidence = 0.0f;
+};
+
+struct NoiseEstimate {
+    float sigmaLuma = 0.0f;
+    float sigmaChroma1 = 0.0f;
+    float sigmaChroma2 = 0.0f;
+    float correlatedLuma = 0.0f;
+    // Fraction of 16x16 blocks accepted by the fine-detail gate. This is
+    // support coverage, NOT a calibrated probability/confidence value.
+    float lumaSupportFraction = 0.0f;
+    // Kept at zero until confidence is calibrated against labeled test data.
+    float confidenceLuma = 0.0f;
+    float confidenceChroma = 0.0f;
+};
+
+struct GlobalMetrics {
+    Eval eval{};
+    int sourceWidth = 0;
+    int sourceHeight = 0;
+    float sourceMeanLuma = 0.0f;
+};
+
 Eval evaluate(const cv::Mat &rgbFloat) {
     int w = rgbFloat.cols;
     int h = rgbFloat.rows;
@@ -428,7 +260,6 @@ Eval evaluate(const cv::Mat &rgbFloat) {
     double sumGraySq = 0.0;
     int dark = 0, shadow = 0, bright = 0, highlight = 0;
 
-    std::vector<float> gray(n);
     const float* ptr = rgbFloat.ptr<float>();
 
     for (int i = 0; i < n; ++i) {
@@ -436,7 +267,6 @@ Eval evaluate(const cv::Mat &rgbFloat) {
         float g = ptr[i * 3 + 1];
         float b = ptr[i * 3 + 2];
         float y = 0.2989f * r + 0.5870f * g + 0.1140f * b;
-        gray[i] = y;
         sumGray += y;
         sumGraySq += y * y;
         if (y < 45.0f) dark++;
@@ -480,49 +310,31 @@ Eval evaluate(const cv::Mat &rgbFloat) {
     // Noise
     cv::Mat blur10 = gaussianBlurCustom(rgbFloat, 1.0f);
     const float* b10Ptr = blur10.ptr<float>();
-    std::vector<float> residual(n);
+    // Preserve the legacy residual-p75 proxy, but avoid allocating and sorting
+    // one float per pixel. Residual is bounded to [0,255], so a 256-bin
+    // histogram gives a deterministic nearest-rank approximation in O(N).
+    // This remains a sharpening heuristic, NOT the authoritative noise model.
+    int residualHist[256] = {};
     for (int i = 0; i < n; ++i) {
         float dr = std::abs(ptr[i * 3] - b10Ptr[i * 3]);
         float dg = std::abs(ptr[i * 3 + 1] - b10Ptr[i * 3 + 1]);
         float db = std::abs(ptr[i * 3 + 2] - b10Ptr[i * 3 + 2]);
-        residual[i] = (dr + dg + db) / 3.0f;
+        int v = clampi(static_cast<int>((dr + dg + db) / 3.0f + 0.5f), 0, 255);
+        ++residualHist[v];
     }
-    std::sort(residual.begin(), residual.end());
-    int p75Idx = clampi(static_cast<int>(n * 0.75f), 0, n - 1);
-    float noise = clampf(residual[p75Idx] * 3.0f, 0.0f, 100.0f);
-
-    // Graphic check
-    std::vector<float> rCh(n), gCh(n), bCh(n);
-    for (int i = 0; i < n; ++i) {
-        rCh[i] = ptr[i * 3];
-        gCh[i] = ptr[i * 3 + 1];
-        bCh[i] = ptr[i * 3 + 2];
+    const int p75Rank = clampi(static_cast<int>(n * 0.75f), 0, n - 1);
+    int cumulative = 0;
+    int p75Value = 0;
+    for (; p75Value < 255; ++p75Value) {
+        cumulative += residualHist[p75Value];
+        if (cumulative > p75Rank) break;
     }
-    cv::Mat rMat(h, w, CV_32FC1, rCh.data());
-    cv::Mat gMat(h, w, CV_32FC1, gCh.data());
-    cv::Mat bMat(h, w, CV_32FC1, bCh.data());
+    float noise = clampf(static_cast<float>(p75Value) * 3.0f, 0.0f, 100.0f);
 
-    cv::Mat er = convolve3x3FindEdges(rMat);
-    cv::Mat eg = convolve3x3FindEdges(gMat);
-    cv::Mat eb = convolve3x3FindEdges(bMat);
-
-    float edgeRatio = 0.0f;
-    float strongEdgeRatio = 0.0f;
-    const float* erP = er.ptr<float>();
-    const float* egP = eg.ptr<float>();
-    const float* ebP = eb.ptr<float>();
-
-    for (int i = 0; i < n; ++i) {
-        float v = 0.299f * erP[i] + 0.587f * egP[i] + 0.114f * ebP[i];
-        if (v > 80.0f) edgeRatio += 1.0f;
-        if (v > 150.0f) strongEdgeRatio += 1.0f;
-    }
-    edgeRatio /= n;
-    strongEdgeRatio /= n;
-    bool isGraphic = (edgeRatio > 0.065f && strongEdgeRatio > 0.014f);
-    // F1 (session 4, member-1 decision): graphic detection DISABLED
-    // entirely -- the edge-density test misfires on noisy photos.
-    isGraphic = false;
+    // Graphic detection was explicitly disabled in v4.3. Do not spend
+    // memory/time constructing three full channels and edge maps for a
+    // decision that is unconditionally false.
+    const bool isGraphic = false;
 
     // Haze
     float haze = 0.0f;
@@ -721,15 +533,29 @@ cv::Mat buildNoiseScoreMap(const cv::Mat &luma, float gb_floor) {
     cv::Sobel(g4, gx4, CV_32F, 1, 0, 3);
     cv::Sobel(g4, gy4, CV_32F, 0, 1, 3);
     cv::magnitude(gx4, gy4, gb);
-    std::vector<float> vals;
-    vals.reserve((size_t)W * H);
+    // Sobel magnitude is bounded for 8-bit-range input. A fixed histogram
+    // avoids a full-resolution float vector + nth_element (about 48 MB at
+    // 12 MP), while retaining sub-gray-level precision for this normalizer.
+    constexpr int ALIGN_HIST_BINS = 4096;
+    constexpr float ALIGN_HIST_SCALE = 2.0f; // 0.5 input-level per bin
+    uint64_t hist[ALIGN_HIST_BINS] = {};
+    const uint64_t totalSamples = static_cast<uint64_t>(W) * H;
     for (int i = 0; i < H; ++i) {
         const float* p = gb.ptr<float>(i);
-        for (int j = 0; j < W; ++j) vals.push_back(p[j]);
+        for (int j = 0; j < W; ++j) {
+            int bin = clampi(static_cast<int>(p[j] * ALIGN_HIST_SCALE + 0.5f),
+                             0, ALIGN_HIST_BINS - 1);
+            ++hist[bin];
+        }
     }
-    size_t k75 = (size_t)(0.75 * (vals.size() - 1));
-    std::nth_element(vals.begin(), vals.begin() + k75, vals.end());
-    float p75 = std::max(vals[k75] + gb_floor, 1e-6f);
+    const uint64_t k75 = static_cast<uint64_t>(0.75 * (totalSamples - 1));
+    uint64_t cumulative = 0;
+    int p75Bin = 0;
+    for (; p75Bin < ALIGN_HIST_BINS - 1; ++p75Bin) {
+        cumulative += hist[p75Bin];
+        if (cumulative > k75) break;
+    }
+    float p75 = std::max(static_cast<float>(p75Bin) / ALIGN_HIST_SCALE + gb_floor, 1e-6f);
     cv::Mat w;
     cv::divide(gb, p75, w);
     cv::min(w, 1.0, w);
@@ -952,6 +778,28 @@ cv::Mat chromaChannel(const cv::Mat &img, int idx) {
     return ch;
 }
 
+// Orthonormal opponent-color coordinates. They are used for noise measurement
+// only; the existing reconstruction/cleaning path remains unchanged. Input
+// RGB is currently sRGB-like code values, so these are not claimed to be
+// physically linear-light noise estimates.
+static void opponentChromaChannels(const cv::Mat &img, cv::Mat &c1, cv::Mat &c2) {
+    c1.create(img.size(), CV_32FC1);
+    c2.create(img.size(), CV_32FC1);
+    const float *src = img.ptr<float>();
+    float *p1 = c1.ptr<float>();
+    float *p2 = c2.ptr<float>();
+    const int n = img.rows * img.cols;
+    constexpr float INV_SQRT2 = 0.70710678118f;
+    constexpr float INV_SQRT6 = 0.40824829046f;
+    for (int i = 0; i < n; ++i) {
+        const float r = src[i * 3];
+        const float g = src[i * 3 + 1];
+        const float b = src[i * 3 + 2];
+        p1[i] = (r - g) * INV_SQRT2;
+        p2[i] = (r + g - 2.0f * b) * INV_SQRT6;
+    }
+}
+
 // v4.3 (F2): fine-chroma-only cleaning (same guided params as NLM's fine
 // chroma). Runs only when luma NLM is skipped but chroma is noisy.
 cv::Mat chromaFineClean(const cv::Mat &img, float gate) {
@@ -1041,13 +889,13 @@ cv::Mat buildSharpMaskScore(const cv::Mat &img, float sigma,
 
 // Per-pixel-factor version of pilContrastMod (same pivot/mean logic).
 cv::Mat pilContrastModMap(const cv::Mat &img, const cv::Mat &fmap,
-                          float darkScale, float brightCap) {
+                          float darkScale, float brightCap, float pivotCap = 255.0f) {
     int px = img.rows * img.cols;
     const float* a = img.ptr<float>();
     double sum = 0.0;
     for (int i = 0; i < px; ++i)
         sum += 0.299 * a[i * 3] + 0.587 * a[i * 3 + 1] + 0.114 * a[i * 3 + 2];
-    float mean = clampf(static_cast<float>(sum / px), 0.0f, 255.0f);
+    float mean = std::min(clampf(static_cast<float>(sum / px), 0.0f, 255.0f), pivotCap);
     cv::Mat out(img.size(), CV_32FC3);
     float* o = out.ptr<float>();
     const float* fm = fmap.ptr<float>();
@@ -1076,13 +924,13 @@ cv::Mat adaptiveContrastS5(const cv::Mat &img, const Eval &ev,
     float darkScale = clampf(ev.brightness / CONTRAST_DARK_REF, CONTRAST_DARK_FLOOR, 1.0f);
     float fg = 1.0f + (factor - 1.0f) * (1.0f - CONTRAST_NOISE_CUT * inputGate);
     if (fg <= 1.001f) return img;
-    if (score.empty()) return pilContrastMod(img, fg, darkScale, CONTRAST_BRIGHT_CAP);
+    if (score.empty()) return pilContrastMod(img, fg, darkScale, CONTRAST_BRIGHT_CAP, PIVOT_CAP);
     cv::Mat fmap(img.rows, img.cols, CV_32FC1);
     const float* sc = score.ptr<float>();
     float* fp = fmap.ptr<float>();
     for (int i = 0; i < img.rows * img.cols; ++i)
         fp[i] = 1.0f + (fg - 1.0f) * (1.0f - sc[i]);
-    return pilContrastModMap(img, fmap, darkScale, CONTRAST_BRIGHT_CAP);
+    return pilContrastModMap(img, fmap, darkScale, CONTRAST_BRIGHT_CAP, PIVOT_CAP);
 }
 
 // --- v4 additions ---
@@ -1486,14 +1334,14 @@ cv::Mat microDetail(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
 }
 
 // Contrast around the image mean with modulated push (v3, unchanged).
-cv::Mat pilContrastMod(const cv::Mat &img, float factor, float darkScale, float brightCap) {
+cv::Mat pilContrastMod(const cv::Mat &img, float factor, float darkScale, float brightCap, float pivotCap) {
     int px = img.rows * img.cols;
     const float* a = img.ptr<float>();
     double sum = 0.0;
     for (int i = 0; i < px; ++i) {
         sum += 0.299 * a[i * 3] + 0.587 * a[i * 3 + 1] + 0.114 * a[i * 3 + 2];
     }
-    float mean = clampf(static_cast<float>(sum / px), 0.0f, 255.0f);
+    float mean = std::min(clampf(static_cast<float>(sum / px), 0.0f, 255.0f), pivotCap);
     cv::Mat out(img.size(), CV_32FC3);
     float* o = out.ptr<float>();
     for (int i = 0; i < px; ++i) {
@@ -1525,13 +1373,13 @@ cv::Mat colorDepth(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
     int px = img.rows * img.cols;
     const float* a = img.ptr<float>();
 
-    std::vector<std::tuple<float, float, float>> hsv(px);
+    // Two-pass HSV conversion avoids retaining three floats per pixel.
+    // At 12 MP the old tuple vector cost roughly 144 MB in addition to the
+    // source and destination Mats. Recompute HSV in pass two instead.
     double sumSat = 0.0;
-
     for (int i = 0; i < px; ++i) {
         float hh, ss, vv;
         rgbToPillowHsv(a[i * 3], a[i * 3 + 1], a[i * 3 + 2], hh, ss, vv);
-        hsv[i] = {hh, ss, vv};
         sumSat += ss / 255.0;
     }
 
@@ -1550,7 +1398,8 @@ cv::Mat colorDepth(const cv::Mat &img, const Eval &ev, const cv::Mat &mask) {
     const float* m = mask.ptr<float>();
 
     for (int i = 0; i < px; ++i) {
-        auto [h, s, v] = hsv[i];
+        float h, s, v;
+        rgbToPillowHsv(a[i * 3], a[i * 3 + 1], a[i * 3 + 2], h, s, v);
         float protection = clampf((v / 255.0f - 0.68f) / 0.32f, 0.0f, 1.0f);
         float effective = boost * (1.0f - protection * 0.60f);
         effective *= (1.0f - (s / 255.0f) * 0.65f);  // vibrance
@@ -1741,73 +1590,118 @@ cv::Mat applyCurve(const cv::Mat &img, float strength) {
 #ifndef ENHANCER_NO_JNI
 // --- Bitmap Conversion Utilities ---
 
-// v4.6 (S7): a bitmap is usable only if getInfo succeeds, the geometry
-// is positive, the format is RGBA_8888 (the channel shifts below assume
-// it), and the row stride covers at least width*4 bytes.
-static bool getValidBitmapInfo(JNIEnv *env, jobject bitmap,
-                               AndroidBitmapInfo &info) {
-    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS)
-        return false;
-    if (info.width <= 0 || info.height <= 0) return false;
-    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return false;
-    if (info.stride < (uint32_t)info.width * 4u) return false;
-    return true;
+// JNI bitmap access is deliberately restricted to RGBA_8888. Android's
+// stride is bytes-per-row and may exceed width*4; never flatten rows as if
+// they were tightly packed. Conversion uses byte order, not uint32 shifts.
+struct AndroidBitmapPixels {
+    JNIEnv *env = nullptr;
+    jobject bitmap = nullptr;
+    void *pixels = nullptr;
+    bool locked = false;
+
+    AndroidBitmapPixels(JNIEnv *e, jobject b) : env(e), bitmap(b) {}
+    bool lock() {
+        if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || !pixels)
+            return false;
+        locked = true;
+        return true;
+    }
+    ~AndroidBitmapPixels() {
+        if (locked) AndroidBitmap_unlockPixels(env, bitmap);
+    }
+};
+
+static void throwBitmapError(JNIEnv *env, const char *className, const char *message) {
+    if (!env || env->ExceptionCheck()) return;
+    jclass cls = env->FindClass(className);
+    if (cls) {
+        env->ThrowNew(cls, message);
+        env->DeleteLocalRef(cls);
+    }
 }
 
-// Returns false on any failure; the caller must leave dst untouched.
 bool bitmapToFloatRgb(JNIEnv *env, jobject bitmap, cv::Mat &matRgbFloat) {
-    AndroidBitmapInfo info;
-    if (!getValidBitmapInfo(env, bitmap, info)) return false;
-    void *pixels = nullptr;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS)
+    if (!env || !bitmap) {
+        throwBitmapError(env, "java/lang/IllegalArgumentException", "Source bitmap is null");
         return false;
-
-    matRgbFloat.create(info.height, info.width, CV_32FC3);
-    float* dst = matRgbFloat.ptr<float>();
-    const uint8_t* base = static_cast<const uint8_t*>(pixels);
-    for (int y = 0; y < info.height; ++y) {
-        // v4.6 (S7): rows are stride bytes apart, NOT width*4 -- padded
-        // bitmaps were previously read sheared.
-        const uint32_t* row = reinterpret_cast<const uint32_t*>(
-            base + (size_t)y * info.stride);
-        for (int x = 0; x < info.width; ++x) {
-            uint32_t p = row[x];
-            int o = (y * info.width + x) * 3;
-            dst[o]     = static_cast<float>((p >> 16) & 0xFF); // R
-            dst[o + 1] = static_cast<float>((p >> 8)  & 0xFF); // G
-            dst[o + 2] = static_cast<float>(p         & 0xFF); // B
-        }
     }
 
-    AndroidBitmap_unlockPixels(env, bitmap);
+    AndroidBitmapInfo info{};
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        throwBitmapError(env, "java/lang/IllegalArgumentException", "Cannot read source bitmap info");
+        return false;
+    }
+    if (info.width == 0 || info.height == 0 ||
+        info.width > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        info.height > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        info.width > std::numeric_limits<uint32_t>::max() / 4u ||
+        info.stride < info.width * 4u || info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        throwBitmapError(env, "java/lang/IllegalArgumentException",
+                         "Source bitmap must be valid RGBA_8888 with a supported stride");
+        return false;
+    }
+
+    // Allocate before locking so an allocation failure cannot leave pixels locked.
+    matRgbFloat.create(static_cast<int>(info.height), static_cast<int>(info.width), CV_32FC3);
+    AndroidBitmapPixels lock(env, bitmap);
+    if (!lock.lock()) {
+        throwBitmapError(env, "java/lang/IllegalStateException", "Cannot lock source bitmap pixels");
+        return false;
+    }
+
+    const auto *base = static_cast<const uint8_t *>(lock.pixels);
+    for (int y = 0; y < matRgbFloat.rows; ++y) {
+        const uint8_t *src = base + static_cast<size_t>(y) * info.stride;
+        float *dst = matRgbFloat.ptr<float>(y);
+        for (int x = 0; x < matRgbFloat.cols; ++x) {
+            const uint8_t *px = src + static_cast<size_t>(x) * 4u;
+            dst[x * 3]     = static_cast<float>(px[0]); // R
+            dst[x * 3 + 1] = static_cast<float>(px[1]); // G
+            dst[x * 3 + 2] = static_cast<float>(px[2]); // B
+        }
+    }
     return true;
 }
 
-// Returns false on any failure (nothing is written if the lock fails).
 bool floatRgbToBitmap(JNIEnv *env, const cv::Mat &matRgbFloat, jobject bitmap) {
-    AndroidBitmapInfo info;
-    if (!getValidBitmapInfo(env, bitmap, info)) return false;
-    if (matRgbFloat.cols != info.width || matRgbFloat.rows != info.height)
+    if (!env || !bitmap || matRgbFloat.empty() || matRgbFloat.type() != CV_32FC3) {
+        throwBitmapError(env, "java/lang/IllegalArgumentException", "Invalid destination bitmap or RGB image");
         return false;
-    void *pixels = nullptr;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS)
-        return false;
-
-    const float* src = matRgbFloat.ptr<float>();
-    uint8_t* base = static_cast<uint8_t*>(pixels);
-    for (int y = 0; y < info.height; ++y) {
-        uint32_t* row = reinterpret_cast<uint32_t*>(
-            base + (size_t)y * info.stride);
-        for (int x = 0; x < info.width; ++x) {
-            int o = (y * info.width + x) * 3;
-            int r = clampi(static_cast<int>(src[o] + 0.5f), 0, 255);      // v4.5 (S6-4): round, was truncate
-            int g = clampi(static_cast<int>(src[o + 1] + 0.5f), 0, 255);  // (matches the +0.5 precedent elsewhere)
-            int b = clampi(static_cast<int>(src[o + 2] + 0.5f), 0, 255);
-            row[x] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-        }
     }
 
-    AndroidBitmap_unlockPixels(env, bitmap);
+    AndroidBitmapInfo info{};
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        throwBitmapError(env, "java/lang/IllegalArgumentException", "Cannot read destination bitmap info");
+        return false;
+    }
+    if (info.width != static_cast<uint32_t>(matRgbFloat.cols) ||
+        info.height != static_cast<uint32_t>(matRgbFloat.rows) ||
+        info.width == 0 || info.height == 0 ||
+        info.width > std::numeric_limits<uint32_t>::max() / 4u ||
+        info.stride < info.width * 4u || info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+        throwBitmapError(env, "java/lang/IllegalArgumentException",
+                         "Destination bitmap must match image dimensions and be RGBA_8888");
+        return false;
+    }
+
+    AndroidBitmapPixels lock(env, bitmap);
+    if (!lock.lock()) {
+        throwBitmapError(env, "java/lang/IllegalStateException", "Cannot lock destination bitmap pixels");
+        return false;
+    }
+
+    auto *base = static_cast<uint8_t *>(lock.pixels);
+    for (int y = 0; y < matRgbFloat.rows; ++y) {
+        uint8_t *dst = base + static_cast<size_t>(y) * info.stride;
+        const float *src = matRgbFloat.ptr<float>(y);
+        for (int x = 0; x < matRgbFloat.cols; ++x) {
+            uint8_t *px = dst + static_cast<size_t>(x) * 4u;
+            px[0] = static_cast<uint8_t>(clampi(static_cast<int>(src[x * 3] + 0.5f), 0, 255));
+            px[1] = static_cast<uint8_t>(clampi(static_cast<int>(src[x * 3 + 1] + 0.5f), 0, 255));
+            px[2] = static_cast<uint8_t>(clampi(static_cast<int>(src[x * 3 + 2] + 0.5f), 0, 255));
+            px[3] = 255;
+        }
+    }
     return true;
 }
 
@@ -1821,38 +1715,56 @@ Java_com_master_aistudio_utils_NativeSmartEnhancer_nativeEnhance(
         jobject dstBitmap) {
     (void)thiz;
 
-    // v4.6 (S7): validate BOTH bitmaps and their match BEFORE any work.
-    // On any failure return early with dst untouched (void return kept:
-    // the Kotlin call site is unchanged).
-    AndroidBitmapInfo srcInfo, dstInfo;
-    if (!getValidBitmapInfo(env, srcBitmap, srcInfo) ||
-        !getValidBitmapInfo(env, dstBitmap, dstInfo) ||
-        srcInfo.width != dstInfo.width || srcInfo.height != dstInfo.height)
-        return;
-
+    try {
     cv::Mat work;
     if (!bitmapToFloatRgb(env, srcBitmap, work)) return;
 
-    // v4.6 (S7): evaluate on the FULL ORIGINAL image, BEFORE the curve
-    // (old: on a 1280 max-edge preview of the curved image).
-    Eval ev = evaluate(work);
+    // Keep the immutable original analysis reference. The user curve is a
+    // processing transform and must not redefine the measured input metrics.
+    cv::Mat analysisSrc = work;
+    float preLum = quickMeanLum(analysisSrc);
 
-    // 0. Adaptive user curve (strength measured from the photo).
-    float preLum = quickMeanLum(work);
+    // 0. Adaptive user curve, applied only to the processing image.
     work = applyCurve(work, curveStrengthFor(preLum));
 
-    // 1. Pipeline (v4.1 order).
+    // 1. Global evaluation on a bounded preview of the ORIGINAL image.
+    cv::Mat evalSrc = analysisSrc;
+    int maxEdge = std::max(work.cols, work.rows);
+    if (maxEdge > 1280) {
+        float scale = 1280.0f / maxEdge;
+        int nw = std::max(1, static_cast<int>(work.cols * scale));
+        int nh = std::max(1, static_cast<int>(work.rows * scale));
+        cv::resize(analysisSrc, evalSrc, cv::Size(nw, nh), 0, 0, cv::INTER_AREA);
+    }
+    Eval ev = evaluate(evalSrc);
+    evalSrc.release();
+    analysisSrc.release(); // no longer needed; work is the independent curve result
+
+    // 2. Pipeline (v4.1 order).
     cv::Mat out = whiteBalance(work, ev);
     cv::Mat ref = out;                                // v4.1: colour reference for chromaRestore
     // v4.3 (F2): adaptive sigma + chroma gate.
     SigmaInfo si = estimateSigmaAdaptive(out);
     float sigma = si.sigma;
     float fineGate = 0.0f;
+    NoiseEstimate noiseEstimate;
+    noiseEstimate.sigmaLuma = sigma;
+    noiseEstimate.correlatedLuma = si.corr;
+    noiseEstimate.lumaSupportFraction = si.lowFrac;
+    // Do not misrepresent the accepted-block fraction as confidence.
+    // Confidence remains unknown until calibrated on synthetic + real data.
+    noiseEstimate.confidenceLuma = 0.0f;
     {
-        cv::Mat cb = chromaChannel(out, 1);
-        cv::Mat cr = chromaChannel(out, 2);
-        float chPc = 0.5f * (immerkaerChan(cb) + immerkaerChan(cr));
-        fineGate = smoothstep01(chPc, CHROMA_GATE_LO, CHROMA_GATE_HI);
+        cv::Mat c1, c2;
+        opponentChromaChannels(out, c1, c2);
+        noiseEstimate.sigmaChroma1 = immerkaerChan(c1);
+        noiseEstimate.sigmaChroma2 = immerkaerChan(c2);
+        noiseEstimate.confidenceChroma = 0.0f; // no calibrated confidence model yet
+        float chromaSigma = std::max(noiseEstimate.sigmaChroma1,
+                                     noiseEstimate.sigmaChroma2);
+        fineGate = smoothstep01(chromaSigma, CHROMA_GATE_LO, CHROMA_GATE_HI);
+        c1.release();
+        c2.release();
     }
     float noiseGate = smoothstep01(sigma, CHROMA_GATE_LO, CHROMA_GATE_HI);  // v4.1
     if (!ev.isGraphic) {
@@ -1866,9 +1778,14 @@ Java_com_master_aistudio_utils_NativeSmartEnhancer_nativeEnhance(
     // v4.2: gate open -> full v4.1 path (with chroma suppression);
     // gate closed -> map-modulated luma-only path (chroma exact).
     cv::Mat noiseScore = buildNoiseScoreMap(lumaOf(out), ALIGN_FLOOR_K * sigma);
-    if (noiseGate >= 1.0f) out = darkFlatClean(out, darkMask, noiseGate);
-    else out = darkFlatCleanMap(out, darkMask, noiseScore,
-                                buildPeriodMap(lumaOf(out)));
+    if (noiseGate >= 1.0f) {
+        out = darkFlatClean(out, darkMask, noiseGate);
+    } else {
+        cv::Mat periodMap = buildPeriodMap(lumaOf(out));
+        out = darkFlatCleanMap(out, darkMask, noiseScore, periodMap);
+        periodMap.release();
+    }
+    noiseScore.release();
     out = localShadowLift(out);                       // v4.1: multiplicative lift
     SigmaInfo si2 = estimateSigmaAdaptive(out);       // v4.3 (F2): residual adaptive sigma
     float sigma2 = si2.sigma;
@@ -1879,14 +1796,25 @@ Java_com_master_aistudio_utils_NativeSmartEnhancer_nativeEnhance(
     out = microDetail(out, ev, sharpMask);
     out = adaptiveContrastS5(out, ev, noiseGate, score2);  // v4.4 (S5)
     out = colorDepth(out, ev, darkMask);
+    darkMask.release();
+    score2.release();
     out = tonalDepth(out, ev);
     out = crystalSharpen(out, ev, sharpMask);
     out = fineCrisp(out, ev, sharpMask);
     if (!ev.isGraphic) out = chromaRestore(out, ref); // v4.1: saturation anchor
+    ref.release();
     out = highlightSafety(out, work);
 
-    // 3. Render back to Bitmap (failure leaves dst as-is; nothing more
-    // to do -- the function simply ends).
-    if (!floatRgbToBitmap(env, out, dstBitmap)) return;
+    // 3. Render back to Bitmap.
+    (void)floatRgbToBitmap(env, out, dstBitmap);
+    } catch (const cv::Exception &e) {
+        throwBitmapError(env, "java/lang/RuntimeException", e.what());
+    } catch (const std::bad_alloc &) {
+        throwBitmapError(env, "java/lang/OutOfMemoryError", "Native image processing ran out of memory");
+    } catch (const std::exception &e) {
+        throwBitmapError(env, "java/lang/RuntimeException", e.what());
+    } catch (...) {
+        throwBitmapError(env, "java/lang/RuntimeException", "Unknown native image processing error");
+    }
 }
 #endif // ENHANCER_NO_JNI
