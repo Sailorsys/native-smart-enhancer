@@ -1,4 +1,4 @@
- // ===============================================
+// ============================================================================
 
 #ifndef ENHANCER_NO_JNI
 #include <jni.h>
@@ -1655,9 +1655,9 @@ bool bitmapToFloatRgb(JNIEnv *env, jobject bitmap, cv::Mat &matRgbFloat) {
         float *dst = matRgbFloat.ptr<float>(y);
         for (int x = 0; x < matRgbFloat.cols; ++x) {
             const uint8_t *px = src + static_cast<size_t>(x) * 4u;
-            dst[x * 3]     = static_cast<float>(px[0]); // R
+            dst[x * 3]     = static_cast<float>(px[2]); // R (little-endian ARGB_8888 bytes are B,G,R,A)
             dst[x * 3 + 1] = static_cast<float>(px[1]); // G
-            dst[x * 3 + 2] = static_cast<float>(px[2]); // B
+            dst[x * 3 + 2] = static_cast<float>(px[0]); // B (little-endian ARGB_8888 bytes are B,G,R,A)
         }
     }
     return true;
@@ -1696,9 +1696,9 @@ bool floatRgbToBitmap(JNIEnv *env, const cv::Mat &matRgbFloat, jobject bitmap) {
         const float *src = matRgbFloat.ptr<float>(y);
         for (int x = 0; x < matRgbFloat.cols; ++x) {
             uint8_t *px = dst + static_cast<size_t>(x) * 4u;
-            px[0] = static_cast<uint8_t>(clampi(static_cast<int>(src[x * 3] + 0.5f), 0, 255));
+            px[0] = static_cast<uint8_t>(clampi(static_cast<int>(src[x * 3 + 2] + 0.5f), 0, 255)); // B
             px[1] = static_cast<uint8_t>(clampi(static_cast<int>(src[x * 3 + 1] + 0.5f), 0, 255));
-            px[2] = static_cast<uint8_t>(clampi(static_cast<int>(src[x * 3 + 2] + 0.5f), 0, 255));
+            px[2] = static_cast<uint8_t>(clampi(static_cast<int>(src[x * 3] + 0.5f), 0, 255)); // R
             px[3] = 255;
         }
     }
